@@ -54,12 +54,14 @@ def run_moeo_wcd(pubkey, enc_costs, enc_quals,
                 u0 = partial_decrypt(cost, share0, pubkey, n_sq)
                 u1 = partial_decrypt(cost, share1, pubkey, n_sq)
                 dec_cost = combine_shares(u0, u1, mu, n)
+                print(dec_cost)
 
-                # ✅ 正常协同解密：质量（记得除以100恢复原始单位）
+                # ✅ 正常协同解密：质量
                 qual = evaluate_quality_stable(x, enc_quals, pubkey)
                 uq0 = partial_decrypt(qual, share0, pubkey, n_sq)
                 uq1 = partial_decrypt(qual, share1, pubkey, n_sq)
                 dec_qual = combine_shares(uq0, uq1, mu, n)
+                print(dec_qual)
 
             obj_list.append([dec_cost, dec_qual])
 

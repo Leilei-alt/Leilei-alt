@@ -45,7 +45,7 @@ def batch_run(num_runs=2):
             mu=mu,
             n=n,
             n_sq=n_sq,
-            num_iter=1,
+            num_iter=5,
             pop_size=20
         )
 
@@ -65,7 +65,7 @@ def batch_run(num_runs=2):
             'run': run + 1,
             'solution': best_x,
             'cost': round(dec_cost, 2),
-            'quality': round(dec_qual / 100, 4)  # 质量解密后除以100
+            'quality': round(dec_qual, 4)  # 质量解密后除以100
         })
 
     # 保存 CSV
@@ -75,20 +75,7 @@ def batch_run(num_runs=2):
         writer.writerows(results)
     print("📄 所有最优解保存至 best_solutions_threshold.csv")
 
-    # 绘图
-    costs = [r['cost'] for r in results]
-    quals = [r['quality'] for r in results]
-    plt.figure()
-    plt.scatter(costs, quals, color='blue')
-    for i in range(len(results)):
-        plt.text(costs[i], quals[i], f"R{i+1}", fontsize=8)
-    plt.xlabel("成本 (Cost)")
-    plt.ylabel("质量 (Quality)")
-    plt.title(f"批量运行 {num_runs} 次的最优目标分布图")
-    plt.grid(True)
-    plt.savefig("batch_objective_distribution_threshold.png")
-    plt.show()
-    print("📈 图像保存至 batch_objective_distribution_threshold.png")
+
 
 # -------------------------
 if __name__ == "__main__":

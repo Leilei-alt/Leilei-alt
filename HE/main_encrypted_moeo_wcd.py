@@ -37,7 +37,7 @@ def main():
         mu=mu,
         n=n,
         n_sq=n_sq,
-        num_iter=10,
+        num_iter=5,
         pop_size=20
     )
 

@@ -52,11 +52,12 @@ def partial_decrypt(ciphertext_obj, share_i, pubkey, n_sq):
 # 聚合两份部分解密 → 明文
 # ---------------------------
 def combine_shares(u0, u1, mu, n, max_bits=4096):
+    """
     # ⚠️ 安全检查：防止部分解密数值过大
     if u0.bit_length() > max_bits or u1.bit_length() > max_bits:
-        print("⚠️ 警告：部分解密结果位数过大！可能存在浮点误加密或原始明文过大！")
         print(f"u0 位数: {u0.bit_length()} bit")
         print(f"u1 位数: {u1.bit_length()} bit")
+    """
     u = (u0 * u1) % (n * n)  # 合并部分解密结果
     L = (u - 1) // n  # 计算L函数
     m = (L * mu) % n  # 恢复明文

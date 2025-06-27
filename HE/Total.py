@@ -3,6 +3,7 @@ import random
 import numpy as np
 import pickle
 import os
+import math
 
 # 模拟辅助服务器 S1 的比较服务
 
@@ -140,6 +141,8 @@ def compute_weighted_crowding_distance(obj_values, dec_values, front, alpha=0.5)
 # ---------------------------
 # 阈值密钥生成（share0 + share1 = λ）
 # ---------------------------
+def lcm(a, b):
+    return abs(a * b) // math.gcd(a, b)
 def generate_threshold_keypair():
     pubkey, privkey = paillier.generate_paillier_keypair()
     n = pubkey.n
@@ -147,7 +150,7 @@ def generate_threshold_keypair():
 
     # 通过公开API计算lambda和mu
     p, q = privkey.p, privkey.q
-    lambda_val = (p - 1) * (q - 1)
+    lambda_val = lcm(p-1,q-1)
     mu_val = pow(lambda_val, -1, n)  # μ = λ⁻¹ mod n
 
     # 简单线性分片：λ = share0 + share1
@@ -339,10 +342,139 @@ def prepare_data():
         key_parts['mu'], key_parts['n'], key_parts['n_sq']  # 聚合用参数
     )
 
+#手动开方
+def isqrt(n):
+    x = n
+    y = (x + 1) // 2
+    while y < x:
+        x = y
+        y = (x + n // x) // 2
+    return x
+
+#后加的密文下乘法（SMUL）
+def secure_multiply(enc_x, enc_y, pubkey, share0, share1, mu, n, n_sq):
+    """
+    安全密文乘法：返回加密形式的 x * y
+    :param enc_x: 密文 \llbracket x \rrbracket
+    :param enc_y: 密文 \llbracket y \rrbracket
+    :return: 密文 \llbracket x * y \rrbracket
+    """
+    # 随机掩码
+    max_r = isqrt(pubkey.n) // 8  # 控制乘积大小
+    r1 = random.randint(1, max_r)
+    r2 = random.randint(1, max_r)
+
+    # 扰动掩码加密
+    enc_r1 = pubkey.encrypt(r1)
+    enc_r2 = pubkey.encrypt(r2)
+    enc_r1r2 = pubkey.encrypt(r1 * r2)
+
+    # 构造干扰项
+    enc_x_r2 = enc_x * r2 * -1
+    enc_y_r1 = enc_y * r1 * -1
+
+    # 构造混合掩码
+    enc_x_ = enc_x + enc_r1
+    enc_y_ = enc_y + enc_r2
+
+    # 密文乘法（模拟 S1 的解密协作）
+    # 恢复 y + r2
+    u0 = partial_decrypt(enc_y_, share0, pubkey, n_sq)
+    u1 = partial_decrypt(enc_y_, share1, pubkey, n_sq)
+    y_plus_r2 = combine_shares(u0, u1, mu, n)
+
+    # 执行密文乘明文
+    enc_xy_noisy = enc_x_ * y_plus_r2
+
+    # 分布式协同解密（可替换上方行）
+    # enc_xy_noisy = encrypted_number(pubkey, (enc_x_.ciphertext(False) ** (share0 + share1)) % n_sq)
+    # 更高安全性下应使用 S1 的门限解密流程还原 x′, y′ 并乘后再加密
+
+    # 消除干扰项
+    result = enc_xy_noisy + enc_x_r2 + enc_y_r1 + enc_r1r2 * -1
+    return result
+
+#后加的密文比较协议SCMP
+def secure_compare(enc_x, enc_y, pubkey, share0, share1, mu, n, n_sq):
+    """
+    密文比较协议：判断 x < y，返回 \llbracket 1 \rrbracket 或 \llbracket 0 \rrbracket
+    """
+    # 适当缩小扰动范围
+    r = random.randint(2, 2**10)
+    r_dash = random.randint(n // 5, n // 4)
+
+    # 构造 \llbracket y - x + 1 \rrbracket
+    enc_diff_base = enc_y - enc_x + pubkey.encrypt(1)
+
+    # 逐步构造：\llbracket r·(x−y+1) \rrbracket
+    enc_r_diff = enc_diff_base * r
+
+    # 再加上扰动偏移 r'
+    enc_full = enc_r_diff + pubkey.encrypt(r_dash)
+
+    # 门限解密
+    u0 = partial_decrypt(enc_full, share0, pubkey, n_sq)
+    u1 = partial_decrypt(enc_full, share1, pubkey, n_sq)
+    d = combine_shares(u0, u1, mu, n)
+
+    # 输出密文形式的结果
+    threshold = r_dash  # 改为与 r' 本身比较
+    if d > threshold:
+        return pubkey.encrypt(1)
+    else:
+        return pubkey.encrypt(0)
+
+
+
+#离线加载缓存
+def generate_offline_cache(pubkey, num_sets=10):
+    """
+    离线阶段生成密文扰动缓存元组：包括 enc(r1), enc(r2), enc(-r1*r2), enc(0), enc(1)
+    :param pubkey: Paillier 公钥
+    :param num_sets: 要生成的缓存元组数量
+    :return: None（写入本地文件）
+    """
+    cache_list = []
+
+    for _ in range(num_sets):
+        r1 = random.randint(1, pubkey.n // 4)
+        r2 = random.randint(1, pubkey.n // 4)
+        enc_r1 = pubkey.encrypt(r1)
+        enc_r2 = pubkey.encrypt(r2)
+        enc_r1r2 = pubkey.encrypt(r1 * r2)
+        enc_0 = pubkey.encrypt(0)
+        enc_1 = pubkey.encrypt(1)
+
+        cache_list.append({
+            'r1': r1, 'r2': r2,
+            'enc_r1': enc_r1,
+            'enc_r2': enc_r2,
+            'enc_r1r2': enc_r1r2,
+            'enc_0': enc_0,
+            'enc_1': enc_1
+        })
+
+    with open("offline_cache.pkl", "wb") as f:
+        pickle.dump(cache_list, f)
+
+    print(f"✅ 离线缓存生成完毕，共 {num_sets} 组扰动元组")
+
+#在线阶段加载缓存
+def load_offline_cache():
+    """
+    加载本地保存的 offline 缓存扰动元组
+    :return: list of dict
+    """
+    with open("offline_cache.pkl", "rb") as f:
+        return pickle.load(f)
+
+
+
 # -----------------------------
 # 主运行流程
 # -----------------------------
 def main():
+
     print("🔐 加密众包优化系统启动...")
     pubkey, enc_costs, enc_quals, share0, share1, mu, n, n_sq = prepare_data()
 
@@ -355,11 +487,38 @@ def main():
         mu=mu,
         n=n,
         n_sq=n_sq,
-        num_iter=5,
-        pop_size=20
+        num_iter=1,
+        pop_size=5
     )
 
     print(f"\n✅ 最终任务分配方案（0表示未选中，1表示被分配）：\n{best_x}")
+
+    print("\n🔬 测试密文乘法：")
+    x = 30
+    y = 445
+    enc_x = pubkey.encrypt(x)
+    enc_y = pubkey.encrypt(y)
+
+    enc_prod = secure_multiply(enc_x, enc_y, pubkey, share0, share1, mu, n, n_sq)
+    u0 = partial_decrypt(enc_prod, share0, pubkey, n_sq)
+    u1 = partial_decrypt(enc_prod, share1, pubkey, n_sq)
+    decrypted_result = combine_shares(u0, u1, mu, n)
+    print(f"✅ 计算 {x} * {y} = {decrypted_result}")
+
+    print("\n🔬 测试密文比较：")
+    x = 70
+    y = 10
+    enc_x = pubkey.encrypt(x)
+    enc_y = pubkey.encrypt(y)
+
+    enc_mu = secure_compare(enc_x, enc_y, pubkey, share0, share1, mu, n, n_sq)
+    mu = combine_shares(
+        partial_decrypt(enc_mu, share0, pubkey, n_sq),
+        partial_decrypt(enc_mu, share1, pubkey, n_sq),
+        mu, n
+    )
+    print(f"🔎 比较结果: {x} < {y} ? ⇒ {'是' if mu == 1 else '否'}")
+
 
 # -----------------------------
 if __name__ == "__main__":

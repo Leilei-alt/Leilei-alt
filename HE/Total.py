@@ -60,6 +60,7 @@ def decrypt_list(private_key, encrypted_values):
 # 输入：二维列表 obj_values，每个元素是一个个体的 [目标1, 目标2]
 # 输出：Pareto 层级列表 fronts，每一层包含个体索引
 # ----------------------------------------------------
+""""
 def fast_non_dominated_sort(obj_values):
     S = [[] for _ in range(len(obj_values))]
     n = [0 for _ in range(len(obj_values))]
@@ -94,9 +95,68 @@ def fast_non_dominated_sort(obj_values):
     if len(fronts[-1]) == 0:
         fronts.pop()
     return fronts
+    """
+def fast_non_dominated_sort_enc(obj_list, pubkey, share0, share1, mu, n, n_sq):
+    """
+    使用密文比较完成非支配排序过程，适用于 encrypted obj_list。
+    每个 obj_list[i] 是加密后的目标值列表。
+    返回：fronts（List[List[int]]）多层非支配解索引
+    """
+    S = {}         # 支配集合
+    n_dom = {}     # 被支配次数
+    fronts = [[]]  # 非支配层
+
+    for p in range(len(obj_list)):
+        S[p] = []
+        n_dom[p] = 0
+        for q in range(len(obj_list)):
+            if p == q:
+                continue
+            if dominates_enc(obj_list[p], obj_list[q], pubkey, share0, share1, mu, n, n_sq):
+                S[p].append(q)
+            elif dominates_enc(obj_list[q], obj_list[p], pubkey, share0, share1, mu, n, n_sq):
+                n_dom[p] += 1
+        if n_dom[p] == 0:
+            fronts[0].append(p)
+
+    i = 0
+    while len(fronts[i]) > 0:
+        next_front = []
+        for p in fronts[i]:
+            for q in S[p]:
+                n_dom[q] -= 1
+                if n_dom[q] == 0:
+                    next_front.append(q)
+        i += 1
+        fronts.append(next_front)
+
+    # 去掉最后一个空层
+    if len(fronts[-1]) == 0:
+        fronts.pop()
+    return fronts
+
 
 def dominates(ind1, ind2):
     return all(x <= y for x, y in zip(ind1, ind2)) and any(x < y for x, y in zip(ind1, ind2))
+#上面的重构版本
+def dominates_enc(ind1, ind2, pubkey, share0, share1, mu, n, n_sq):
+    enc_cost1, enc_qual1 = ind1[1], ind1[2]
+    enc_cost2, enc_qual2 = ind2[1], ind2[2]
+
+    comp1 = secure_compare(enc_cost1, enc_cost2, pubkey, share0, share1, mu, n, n_sq)
+    comp2 = secure_compare(enc_qual2, enc_qual1, pubkey, share0, share1, mu, n, n_sq)
+
+    u01 = partial_decrypt(comp1, share0, pubkey, n_sq)
+    u02 = partial_decrypt(comp2, share0, pubkey, n_sq)
+    u11 = partial_decrypt(comp1, share1, pubkey, n_sq)
+    u12 = partial_decrypt(comp2, share1, pubkey, n_sq)
+
+    b1 = combine_shares(u01, u11, mu, n)  # cost1 < cost2
+    b2 = combine_shares(u02, u12, mu, n)  # qual1 > qual2
+
+    return b1 == 1 and b2 == 1
+
+
 
 # ----------------------------------------------------
 # 📌 Crowding Distance
@@ -136,6 +196,73 @@ def compute_weighted_crowding_distance(obj_values, dec_values, front, alpha=0.5)
         distances[idx] = alpha * dist_obj[i] + (1 - alpha) * dist_dec[i]
 
     return distances
+
+#密文下计算个体在某一非支配层内的拥塞距离（Crowding Distance）
+def calculate_crowding_distance_enc(front, obj_list, pubkey, share0, share1, mu, n, n_sq):
+    """
+    front: 当前非支配层的索引列表（如 [1,3,6,...]）
+    obj_list: 所有个体的加密目标列表 [[Enc(f1), Enc(f2)], ...]
+    返回：crowding_distances（dict），索引为个体编号，值为密文加密的距离
+    """
+    num_obj = len(obj_list[0])
+    distance = {i: pubkey.encrypt(0) for i in front}  # 初始化所有为 Enc(0)
+
+    for m in range(num_obj):
+        # 对 front 中个体按第 m 个目标进行排序（用 secure_compare）
+        def cmp_key(i1, i2):
+            enc_a = obj_list[i1][m]
+            enc_b = obj_list[i2][m]
+            comp = secure_compare(enc_a, enc_b, pubkey, share0, share1, mu, n, n_sq)
+            return combine_shares(*partial_decrypt(comp, share0, pubkey, n_sq), mu, n)
+
+        sorted_front = sorted(front, key=lambda i: cmp_key(i, i))
+
+        f_min = obj_list[sorted_front[0]][m]
+        f_max = obj_list[sorted_front[-1]][m]
+
+        for i in range(1, len(sorted_front) - 1):
+            prev = obj_list[sorted_front[i - 1]][m]
+            next_ = obj_list[sorted_front[i + 1]][m]
+
+            # 计算邻域差值 diff = (next - prev) / (f_max - f_min)
+            enc_diff = next_ - prev
+
+            # 简化版本：不除以 (f_max - f_min)，避免除法（可改为保留 numerator）
+            distance[sorted_front[i]] += enc_diff  # 等价于“密文加权”距离
+
+    return distance
+
+def compute_weighted_crowding_distance(obj_list, population, front_indices,
+                                       pubkey, share0, share1, mu, n, n_sq,
+                                       alpha=0.5):
+    """
+    使用加权替代策略计算密文拥塞距离（无需排序）：
+    EncCrowding = α × (enc_max_cost - enc_cost) + (1 - α) × enc_qual
+    """
+    enc_costs = [obj_list[i][1] for i in front_indices]
+    enc_quals = [obj_list[i][2] for i in front_indices]
+
+    # 👑 先选出 enc_max_cost
+    max_cost_idx = select_argmax_enc(list(zip(front_indices, enc_costs)),
+                                     pubkey, share0, share1, mu, n, n_sq)
+    enc_max_cost = obj_list[max_cost_idx][1]
+
+    crowding_dict = {}
+
+    for i in front_indices:
+        enc_cost = obj_list[i][1]
+        enc_qual = obj_list[i][2]
+
+        # ➗ crowding = α*(max_cost - cost) + (1-α)*qual
+        enc_diff = enc_max_cost - enc_cost
+        enc_part1 = enc_diff * alpha
+        enc_part2 = enc_qual * (1 - alpha)
+        enc_crowding = enc_part1 + enc_part2
+
+        crowding_dict[i] = enc_crowding
+
+    return crowding_dict
+
 
 
 # ---------------------------
@@ -244,6 +371,7 @@ def evaluate_cost_stable(x, enc_costs, pubkey):
     total = pubkey.encrypt(0)
     for i in range(len(x)):
         if x[i]:
+            print(f"✅ 选中工人: {i}")
             total += enc_costs[i]
     return total
 
@@ -264,6 +392,72 @@ def generate_random_solution(n):
 def mutate_solution(x):
     return [1 - xi if random.random() < 0.1 else xi for xi in x]
 
+#密文Top-k选择器
+def select_topk_by_enc_value(enc_dict, k, pubkey, share0, share1, mu, n, n_sq):
+    """
+    从加密值字典中选择 Top-k 的索引（基于密文比较）。
+    enc_dict: {index: Enc(value)}
+    返回：长度为 ≤ k 的索引列表（按密文最大值优先）
+    """
+    selected = []
+    remaining = list(enc_dict.keys())
+
+    while len(selected) < k and remaining:
+        max_idx = remaining[0]
+        for i in remaining[1:]:
+            comp = secure_compare(enc_dict[i], enc_dict[max_idx], pubkey, share0, share1, mu, n, n_sq)
+            u0 = partial_decrypt(comp, share0, pubkey, n_sq)
+            u1 = partial_decrypt(comp, share1, pubkey, n_sq)
+            result = combine_shares(u0, u1, mu, n)
+            if result == 1:
+                max_idx = i
+
+        selected.append(max_idx)
+        remaining.remove(max_idx)
+
+    return selected
+
+
+#字典为空时随机返回 k 个键（用于补全）
+def select_random_if_empty(enc_dict, k):
+    """如果密文字典为空，则随机选择 k 个索引作为后备方案。"""
+    all_indices = list(enc_dict.keys())
+    if not all_indices:
+        print("⚠️ 后备选择：字典为空，返回空列表")
+        return []
+    return random.sample(all_indices, min(k, len(all_indices)))
+
+#综合使用密文选择 + 随机补全：
+def integrate_elite_selection(population, crowding_dict, k, pubkey, share0, share1, mu, n, n_sq):
+    """
+    综合使用密文排序与随机补全进行精英个体选择。
+    返回：elite_indices 精英个体索引列表
+    """
+    elite_indices = select_topk_by_enc_value(crowding_dict, k, pubkey, share0, share1, mu, n, n_sq)
+    if len(elite_indices) < k:
+        supplement = select_random_if_empty(crowding_dict, k - len(elite_indices))
+        elite_indices += supplement
+    return elite_indices
+
+
+#密文Argmax选择器
+def select_argmax_enc(index_value_pairs, pubkey, share0, share1, mu, n, n_sq):
+    """
+    从 (index, enc_value) 列表中选出最大值对应索引
+    """
+    max_index, max_enc = index_value_pairs[0]
+
+    for idx, enc in index_value_pairs[1:]:
+        enc_cmp = secure_compare(enc, max_enc, pubkey, share0, share1, mu, n, n_sq)
+        u0 = partial_decrypt(enc_cmp, share0, pubkey, n_sq)
+        u1 = partial_decrypt(enc_cmp, share1, pubkey, n_sq)
+        bit = combine_shares(u0, u1, mu, n)
+        if bit == 1:
+            max_index, max_enc = idx, enc
+
+    return max_index
+
+
 # -------------------------------
 # 主优化器（支持阈值解密 + 分配约束）
 # -------------------------------
@@ -274,37 +468,46 @@ def run_moeo_wcd(pubkey, enc_costs, enc_quals,
     n_var = len(enc_costs)
     population = [generate_random_solution(n_var) for _ in range(pop_size)]
 
+    # 🧠 阈值设定（如最低选中数量为2）
+    threshold_plain = 2
+    enc_threshold = pubkey.encrypt(threshold_plain)
+
     for gen in range(num_iter):
         print(f"📘 Generation {gen+1}")
         obj_list = []
 
         for x in population:
-            if sum(x) < 2:
-                # ❌ 不满足最小分配要求：设定为“劣解”
-                dec_cost = 99999
-                dec_qual = 0
+            enc_sum = pubkey.encrypt(0)
+            for xi in x:
+                if xi == 1:
+                    enc_sum += pubkey.encrypt(1)
+
+            # 🔐 密文比较：enc_sum >= threshold ?
+            enc_mu = secure_compare(enc_sum, enc_threshold, pubkey, share0, share1, mu, n, n_sq)
+            u0 = partial_decrypt(enc_mu, share0, pubkey, n_sq)
+            u1 = partial_decrypt(enc_mu, share1, pubkey, n_sq)
+            dec_mu = combine_shares(u0, u1, mu ,n)
+
+            if dec_mu == 0:
+                # 👎 劣解（未满足最小分配）→ 最大成本 / 最低质量
+                enc_cost = pubkey.encrypt(999999)
+                enc_qual = pubkey.encrypt(0)
             else:
-                # ✅ 正常协同解密：成本
-                cost =  evaluate_cost_stable(x, enc_costs, pubkey)
-                u0 = partial_decrypt(cost, share0, pubkey, n_sq)
-                u1 = partial_decrypt(cost, share1, pubkey, n_sq)
-                dec_cost = combine_shares(u0, u1, mu, n)
-                print(dec_cost)
+                enc_cost = evaluate_cost_stable(x, enc_costs, pubkey)
+                enc_qual = evaluate_quality_stable(x, enc_quals, pubkey)
 
-                # ✅ 正常协同解密：质量
-                qual = evaluate_quality_stable(x, enc_quals, pubkey)
-                uq0 = partial_decrypt(qual, share0, pubkey, n_sq)
-                uq1 = partial_decrypt(qual, share1, pubkey, n_sq)
-                dec_qual = combine_shares(uq0, uq1, mu, n)
-                print(dec_qual)
-
-            obj_list.append([dec_cost, dec_qual])
+            obj_list.append((x, enc_cost, enc_qual))
 
         # 非支配排序 + 拥塞距离
-        fronts = fast_non_dominated_sort(obj_list)
-        crowding = compute_weighted_crowding_distance(obj_list, population, fronts[0], alpha=0.5)
+        fronts = fast_non_dominated_sort_enc(obj_list, pubkey, share0, share1, mu, n, n_sq)
+        crowding = compute_weighted_crowding_distance(obj_list, population, fronts[0],
+                                                      pubkey, share0, share1, mu, n, n_sq,
+                                                      alpha=0.5)
 
-        elite_indices = sorted(fronts[0], key=lambda i: -crowding[i])[:pop_size//2]
+        elite_indices = integrate_elite_selection(
+            population, crowding, pop_size // 2, pubkey, share0, share1, mu, n, n_sq
+        )
+
         new_population = [population[i] for i in elite_indices]
 
         while len(new_population) < pop_size:
@@ -314,15 +517,20 @@ def run_moeo_wcd(pubkey, enc_costs, enc_quals,
 
         population = new_population
 
-    # 最后一代：找质量最高解
-    best_idx = max(range(len(population)), key=lambda i: obj_list[i][1])
+    # 最后一代：找质量最高解（以成本最小为目标）
+    best_idx = select_argmax_enc(
+        [(i, obj_list[i][1]) for i in range(len(population))],  # (index, enc_cost)
+        pubkey=pubkey, share0=share0, share1=share1, mu=mu, n=n, n_sq=n_sq
+    )
+
     best_x = population[best_idx]
-    best_cost, best_qual = obj_list[best_idx]
+    best_cost = obj_list[best_idx][1]
+    best_qual = obj_list[best_idx][2]
 
     print("✅ 优化完成，最优匹配解:")
     print(f"   解向量: {best_x}")
-    print(f"   成本: {best_cost:.2f}, 质量: {best_qual :.2f}")
-    return best_x
+    return best_x, best_cost, best_qual
+
 
 # -----------------------------
 # 工人数据准备 + 平台密钥加载
@@ -478,7 +686,7 @@ def main():
     print("🔐 加密众包优化系统启动...")
     pubkey, enc_costs, enc_quals, share0, share1, mu, n, n_sq = prepare_data()
 
-    best_x = run_moeo_wcd(
+    best_x, enc_best_cost, enc_best_qual = run_moeo_wcd(
         pubkey=pubkey,
         enc_costs=enc_costs,
         enc_quals=enc_quals,
@@ -493,31 +701,25 @@ def main():
 
     print(f"\n✅ 最终任务分配方案（0表示未选中，1表示被分配）：\n{best_x}")
 
-    print("\n🔬 测试密文乘法：")
-    x = 30
-    y = 445
-    enc_x = pubkey.encrypt(x)
-    enc_y = pubkey.encrypt(y)
+    # 解密最优解目标值
+    enc_best_cost = evaluate_cost_stable(best_x, enc_costs, pubkey)
+    enc_best_qual = evaluate_quality_stable(best_x, enc_quals, pubkey)
 
-    enc_prod = secure_multiply(enc_x, enc_y, pubkey, share0, share1, mu, n, n_sq)
-    u0 = partial_decrypt(enc_prod, share0, pubkey, n_sq)
-    u1 = partial_decrypt(enc_prod, share1, pubkey, n_sq)
-    decrypted_result = combine_shares(u0, u1, mu, n)
-    print(f"✅ 计算 {x} * {y} = {decrypted_result}")
-
-    print("\n🔬 测试密文比较：")
-    x = 70
-    y = 10
-    enc_x = pubkey.encrypt(x)
-    enc_y = pubkey.encrypt(y)
-
-    enc_mu = secure_compare(enc_x, enc_y, pubkey, share0, share1, mu, n, n_sq)
-    mu = combine_shares(
-        partial_decrypt(enc_mu, share0, pubkey, n_sq),
-        partial_decrypt(enc_mu, share1, pubkey, n_sq),
+    dec_best_cost = combine_shares(
+        partial_decrypt(enc_best_cost, share0, pubkey, n_sq),
+        partial_decrypt(enc_best_cost, share1, pubkey, n_sq),
         mu, n
     )
-    print(f"🔎 比较结果: {x} < {y} ? ⇒ {'是' if mu == 1 else '否'}")
+    dec_best_qual = combine_shares(
+        partial_decrypt(enc_best_qual, share0, pubkey, n_sq),
+        partial_decrypt(enc_best_qual, share1, pubkey, n_sq),
+        mu, n
+    )
+
+    print(f"🔓 解密后目标值：成本 = {dec_best_cost}, 质量 = {dec_best_qual}")
+
+
+
 
 
 # -----------------------------

@@ -329,28 +329,25 @@ def combine_shares(u0, u1, mu, n, max_bits=4096):
     print(f"Combined shares result m: {m}")  # 添加调试信息
     return int(m)
 
-def simulate_worker_upload():
+def simulate_worker_upload(num_tasks=3, num_workers=6):
     keys = generate_threshold_keypair()
     pubkey = keys['pubkey']
     share0, share1 = keys['share0'], keys['share1']
     mu, n, n_sq = keys['mu'], keys['n'], keys['n_sq']
 
-    # 原始数据
-    costs = [10, 15, 12, 20, 5]
-    raw_quals = [9, 8, 5, 7, 6]
+    raw_costs = [[random.randint(10, 30) for _ in range(num_workers)] for _ in range(num_tasks)]
+    raw_quals = [[random.randint(5, 15) for _ in range(num_workers)] for _ in range(num_tasks)]
 
-
-
-
-    # 加密数据
-    enc_costs = [encrypt(pubkey, c) for c in costs]
-    enc_quals = [encrypt(pubkey, q) for q in raw_quals]
+    enc_costs = [[encrypt(pubkey, raw_costs[t][i]) for i in range(num_workers)] for t in range(num_tasks)]
+    enc_quals = [[encrypt(pubkey, raw_quals[t][i]) for i in range(num_workers)] for t in range(num_tasks)]
 
     with open("enc_worker_data.pkl", "wb") as f:
         pickle.dump({
             "pubkey": pubkey,
             "costs": enc_costs,
-            "quals": enc_quals
+            "quals": enc_quals,
+            "raw_costs": raw_costs,
+            "raw_quals": raw_quals
         }, f)
 
     with open("threshold_key_shares.pkl", "wb") as f:
@@ -362,7 +359,9 @@ def simulate_worker_upload():
             "n_sq": n_sq
         }, f)
 
-    print("✅ 工人数据加密并上传成功！")
+    print("✅ 多任务加密数据上传成功")
+
+
 
 # -------------------------------
 # 密文目标函数评估
@@ -375,32 +374,33 @@ def evaluate_cost_stable(x, enc_costs, pubkey):
     :return: Enc(total_cost)
     """
     T = len(x)
-    N = len(enc_costs)
+    N = len(x[0])
     total_cost = pubkey.encrypt(0)
 
     for t in range(T):
         for i in range(N):
             if x[t][i] == 1:
-                total_cost += enc_costs[i]
+                total_cost += enc_costs[t][i]  # ✅ 二维
     return total_cost
-
 
 def evaluate_quality_stable(x, enc_quals, pubkey):
     """
     支持多任务的密文总质量评估。
     :param x: List[List[int]]，T×N 任务-工人分配矩阵
-    :param enc_quals: List[Enc(qual_i)]，长度为 N，每个工人的加密质量
+    :param enc_quals: List[List[Enc(qual)]]，T×N 加密质量矩阵
+    :param pubkey: Paillier 公钥
     :return: Enc(total_quality)
     """
     T = len(x)
-    N = len(enc_quals)
+    N = len(x[0])
     total_qual = pubkey.encrypt(0)
 
     for t in range(T):
         for i in range(N):
             if x[t][i] == 1:
-                total_qual += enc_quals[i]
+                total_qual += enc_quals[t][i]  # ✅ 使用 enc_quals[t][i]
     return total_qual
+
 
 
 # -------------------------------
@@ -553,7 +553,7 @@ def run_moeo_wcd(pubkey, enc_costs, enc_quals,
     1. 每个任务至少分配 min_assign 个工人
     2. 每个工人最多只能被一个任务分配
     """
-    N = len(enc_costs)
+    N = len(enc_costs[0])  # ✅ 每个任务的工人数
     T = num_tasks
 
     population = [generate_random_matrix(T, N, min_assign=min_assign) for _ in range(pop_size)]
@@ -638,9 +638,8 @@ def run_moeo_wcd(pubkey, enc_costs, enc_quals,
 # -----------------------------
 # 工人数据准备 + 平台密钥加载
 # -----------------------------
-def prepare_data():
-    if not os.path.exists("enc_worker_data.pkl") or not os.path.exists("threshold_key_shares.pkl"):
-        simulate_worker_upload()
+def prepare_data(num_tasks, num_workers):
+    simulate_worker_upload(num_tasks=num_tasks, num_workers=num_workers)
 
     with open('enc_worker_data.pkl', 'rb') as f:
         data = pickle.load(f)
@@ -648,10 +647,12 @@ def prepare_data():
         key_parts = pickle.load(f)
 
     return (
-        data['pubkey'], data['costs'], data['quals'],  # 公钥 + 密文目标
-        key_parts['share0'], key_parts['share1'],      # 两方私钥份额
-        key_parts['mu'], key_parts['n'], key_parts['n_sq']  # 聚合用参数
+        data['pubkey'], data['costs'], data['quals'],
+        key_parts['share0'], key_parts['share1'],
+        key_parts['mu'], key_parts['n'], key_parts['n_sq'],
+        data['raw_costs'], data['raw_quals']
     )
+
 
 #手动开方
 def isqrt(n):
@@ -787,14 +788,32 @@ def load_offline_cache():
 def main():
     print("🔐 加密众包优化系统启动...")
 
-    # 加载密钥与加密数据
-    pubkey, enc_costs, enc_quals, share0, share1, mu, n, n_sq = prepare_data()
+    if os.path.exists("enc_worker_data.pkl"):
+        os.remove("enc_worker_data.pkl")
+    if os.path.exists("threshold_key_shares.pkl"):
+        os.remove("threshold_key_shares.pkl")
+
 
     # ✅ 设置多任务参数
     num_tasks = 3         # ⬅️ 任务数，可自定义
+    num_workers = 6
     min_assign = 2        # 每个任务最少分配工人数
-    num_iter = 3          # 进化代数
-    pop_size = 6          # 每代个体数
+    num_iter = 5          # 进化代数
+    pop_size = 10         # 每代个体数
+
+    # ✅ 生成密文数据（带参数）
+    simulate_worker_upload(num_tasks=num_tasks, num_workers=num_workers)
+
+    # ✅ 加载数据与密钥（带参数）
+    pubkey, enc_costs, enc_quals, share0, share1, mu, n, n_sq, raw_costs, raw_quals = \
+        prepare_data(num_tasks=num_tasks, num_workers=num_workers)
+
+    print("\n📌 明文成本矩阵:")
+    for t in range(num_tasks):
+        print(f"任务 {t+1}: {raw_costs[t]}")
+    print("\n📌 明文质量矩阵:")
+    for t in range(num_tasks):
+        print(f"任务 {t+1}: {raw_quals[t]}")
 
     # 🔁 启动多任务多目标优化
     best_x, enc_best_cost, enc_best_qual = run_moeo_wcd(

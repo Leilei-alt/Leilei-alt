@@ -4,7 +4,7 @@ import numpy as np
 import pickle
 import os
 import math
-
+import time
 # 模拟辅助服务器 S1 的比较服务
 
 def s1_compare_encrypted(enc_a, enc_b, privkey):
@@ -787,7 +787,7 @@ def load_offline_cache():
 # -----------------------------
 def main():
     print("🔐 加密众包优化系统启动...")
-
+    start_time = time.time()  # ⏱️ 开始计时
     if os.path.exists("enc_worker_data.pkl"):
         os.remove("enc_worker_data.pkl")
     if os.path.exists("threshold_key_shares.pkl"):
@@ -798,8 +798,8 @@ def main():
     num_tasks = 3         # ⬅️ 任务数，可自定义
     num_workers = 6
     min_assign = 2        # 每个任务最少分配工人数
-    num_iter = 5          # 进化代数
-    pop_size = 10         # 每代个体数
+    num_iter = 2         # 进化代数
+    pop_size = 10       # 每代个体数
 
     # ✅ 生成密文数据（带参数）
     simulate_worker_upload(num_tasks=num_tasks, num_workers=num_workers)
@@ -853,11 +853,9 @@ def main():
     print(f"\n🔓 解密后目标值：")
     print(f"📉 总成本 = {dec_best_cost}")
     print(f"📈 总质量 = {dec_best_qual}")
-
-
-
-
-
+    end_time = time.time()
+    elapsed = end_time - start_time
+    print(f"\n⏱️ 本次运行总耗时：{elapsed:.2f} 秒")
 
 # -----------------------------
 if __name__ == "__main__":

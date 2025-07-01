@@ -62,42 +62,7 @@ def decrypt_list(private_key, encrypted_values):
 # 输入：二维列表 obj_values，每个元素是一个个体的 [目标1, 目标2]
 # 输出：Pareto 层级列表 fronts，每一层包含个体索引
 # ----------------------------------------------------
-""""
-def fast_non_dominated_sort(obj_values):
-    S = [[] for _ in range(len(obj_values))]
-    n = [0 for _ in range(len(obj_values))]
-    rank = [0 for _ in range(len(obj_values))]
 
-    fronts = [[]]
-
-    for p in range(len(obj_values)):
-        S[p] = []
-        n[p] = 0
-        for q in range(len(obj_values)):
-            if dominates(obj_values[p], obj_values[q]):
-                S[p].append(q)
-            elif dominates(obj_values[q], obj_values[p]):
-                n[p] += 1
-        if n[p] == 0:
-            rank[p] = 0
-            fronts[0].append(p)
-
-    i = 0
-    while len(fronts[i]) > 0:
-        Q = []
-        for p in fronts[i]:
-            for q in S[p]:
-                n[q] -= 1
-                if n[q] == 0:
-                    rank[q] = i + 1
-                    Q.append(q)
-        i += 1
-        fronts.append(Q)
-
-    if len(fronts[-1]) == 0:
-        fronts.pop()
-    return fronts
-    """
 def fast_non_dominated_sort_enc(obj_list, pubkey, share0, share1, mu, n, n_sq):
     """
     使用密文比较完成非支配排序过程，适用于 encrypted obj_list。
@@ -138,8 +103,6 @@ def fast_non_dominated_sort_enc(obj_list, pubkey, share0, share1, mu, n, n_sq):
     return fronts
 
 
-def dominates(ind1, ind2):
-    return all(x <= y for x, y in zip(ind1, ind2)) and any(x < y for x, y in zip(ind1, ind2))
 #上面的重构版本
 def dominates_enc(ind1, ind2, pubkey, share0, share1, mu, n, n_sq):
     enc_cost1, enc_qual1 = ind1[1], ind1[2]
@@ -331,37 +294,7 @@ def combine_shares(u0, u1, mu, n, max_bits=4096):
     print(f"Combined shares result m: {m}")  # 添加调试信息
     return int(m)
 
-def simulate_worker_upload(num_tasks=3, num_workers=6):
-    keys = generate_threshold_keypair()
-    pubkey = keys['pubkey']
-    share0, share1 = keys['share0'], keys['share1']
-    mu, n, n_sq = keys['mu'], keys['n'], keys['n_sq']
 
-    raw_costs = [[random.randint(10, 30) for _ in range(num_workers)] for _ in range(num_tasks)]
-    raw_quals = [[random.randint(5, 15) for _ in range(num_workers)] for _ in range(num_tasks)]
-
-    enc_costs = [[encrypt(pubkey, raw_costs[t][i]) for i in range(num_workers)] for t in range(num_tasks)]
-    enc_quals = [[encrypt(pubkey, raw_quals[t][i]) for i in range(num_workers)] for t in range(num_tasks)]
-
-    with open("enc_worker_data.pkl", "wb") as f:
-        pickle.dump({
-            "pubkey": pubkey,
-            "costs": enc_costs,
-            "quals": enc_quals,
-            "raw_costs": raw_costs,
-            "raw_quals": raw_quals
-        }, f)
-
-    with open("threshold_key_shares.pkl", "wb") as f:
-        pickle.dump({
-            "share0": share0,
-            "share1": share1,
-            "mu": mu,
-            "n": n,
-            "n_sq": n_sq
-        }, f)
-
-    print("✅ 多任务加密数据上传成功")
 
 
 
@@ -369,39 +302,35 @@ def simulate_worker_upload(num_tasks=3, num_workers=6):
 # 密文目标函数评估
 # -------------------------------
 def evaluate_cost_stable(x, enc_costs, pubkey):
-    """
-    支持多任务的密文总成本评估。
-    :param x: List[List[int]]，T×N 任务-工人分配矩阵
-    :param enc_costs: List[Enc(cost_i)]，长度为 N，每个工人的加密成本
-    :return: Enc(total_cost)
-    """
     T = len(x)
     N = len(x[0])
-    total_cost = pubkey.encrypt(0)
 
+    # ✅ 正确初始化密文加法
+    total_cost = None
     for t in range(T):
         for i in range(N):
             if x[t][i] == 1:
-                total_cost += enc_costs[t][i]  # ✅ 二维
-    return total_cost
+                if total_cost is None:
+                    total_cost = enc_costs[t][i]
+                else:
+                    total_cost += enc_costs[t][i]
+    return total_cost if total_cost else pubkey.encrypt(0)
+
 
 def evaluate_quality_stable(x, enc_quals, pubkey):
-    """
-    支持多任务的密文总质量评估。
-    :param x: List[List[int]]，T×N 任务-工人分配矩阵
-    :param enc_quals: List[List[Enc(qual)]]，T×N 加密质量矩阵
-    :param pubkey: Paillier 公钥
-    :return: Enc(total_quality)
-    """
     T = len(x)
     N = len(x[0])
-    total_qual = pubkey.encrypt(0)
 
+    total_qual = None
     for t in range(T):
         for i in range(N):
             if x[t][i] == 1:
-                total_qual += enc_quals[t][i]  # ✅ 使用 enc_quals[t][i]
-    return total_qual
+                if total_qual is None:
+                    total_qual = enc_quals[t][i]
+                else:
+                    total_qual += enc_quals[t][i]
+    return total_qual if total_qual else pubkey.encrypt(0)
+
 
 
 
@@ -513,6 +442,33 @@ def select_argmax_enc(index_value_pairs, pubkey, share0, share1, mu, n, n_sq):
 
     return max_index
 
+def select_best_by_custom_score(obj_list, share0, share1, pubkey, mu, n, n_sq, alpha=0.7, beta=0.3, eps=1e-6):
+    """
+    基于自定义评分函数 Score = (alpha * quality) / (beta * cost) 选择最优个体
+    """
+    best_idx = None
+    best_score = float('-inf')
+
+    for i, (_, enc_cost, enc_qual) in enumerate(obj_list):
+        dec_cost = combine_shares(
+            partial_decrypt(enc_cost, share0, pubkey, n_sq),
+            partial_decrypt(enc_cost, share1, pubkey, n_sq),
+            mu, n
+        )
+        dec_qual = combine_shares(
+            partial_decrypt(enc_qual, share0, pubkey, n_sq),
+            partial_decrypt(enc_qual, share1, pubkey, n_sq),
+            mu, n
+        )
+
+        score = (dec_qual * alpha) / (dec_cost * beta + eps)
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    return best_idx
+
+
 #目标是：对每个任务-工人位置 x[t][i] 以一定概率（例如 10%）进行翻转（0 ↔ 1），模拟“基因突变”。
 def mutate_matrix(x, mutation_prob=0.1):
     """
@@ -594,7 +550,110 @@ def parallel_evaluate_population(population, enc_costs, enc_quals, pubkey, share
 
     return results
 
+def simulate_worker_upload(num_tasks=3, num_workers=6):
+    keys = generate_threshold_keypair()
+    pubkey = keys['pubkey']
+    share0, share1 = keys['share0'], keys['share1']
+    mu, n, n_sq = keys['mu'], keys['n'], keys['n_sq']
 
+    raw_costs = [[random.randint(10, 30) for _ in range(num_workers)] for _ in range(num_tasks)]
+    raw_quals = [[random.randint(5, 15) for _ in range(num_workers)] for _ in range(num_tasks)]
+
+    enc_costs = [[encrypt(pubkey, raw_costs[t][i]) for i in range(num_workers)] for t in range(num_tasks)]
+    enc_quals = [[encrypt(pubkey, raw_quals[t][i]) for i in range(num_workers)] for t in range(num_tasks)]
+
+    with open("enc_worker_data.pkl", "wb") as f:
+        pickle.dump({
+            "pubkey": pubkey,
+            "costs": enc_costs,
+            "quals": enc_quals,
+            "raw_costs": raw_costs,
+            "raw_quals": raw_quals
+        }, f)
+
+    with open("threshold_key_shares.pkl", "wb") as f:
+        pickle.dump({
+            "share0": share0,
+            "share1": share1,
+            "mu": mu,
+            "n": n,
+            "n_sq": n_sq
+        }, f)
+
+    print("✅ 多任务加密数据上传成功")
+
+
+def simulate_worker_upload1(num_tasks=3, num_workers=6):
+    keys = generate_threshold_keypair()
+    pubkey = keys['pubkey']
+    share0, share1 = keys['share0'], keys['share1']
+    mu, n, n_sq = keys['mu'], keys['n'], keys['n_sq']
+
+    #raw_costs = [[random.randint(10, 30) for _ in range(num_workers)] for _ in range(num_tasks)]
+    #raw_quals = [[random.randint(5, 15) for _ in range(num_workers)] for _ in range(num_tasks)]
+    raw_costs = [
+        [26, 24, 19, 25, 17],  # 任务1对应每个工人
+        [10, 18, 12, 27, 16],  # 任务2
+        [16, 17, 11, 22, 19],  # 任务3
+    ]
+
+    raw_quals = [
+        [5, 8, 6, 14, 15],   # 任务1
+        [14, 8, 14, 8, 7],  # 任务2
+        [15, 10, 11, 9, 5],   # 任务3
+    ]
+
+    enc_costs = [[encrypt(pubkey, raw_costs[t][i]) for i in range(num_workers)] for t in range(num_tasks)]
+    enc_quals = [[encrypt(pubkey, raw_quals[t][i]) for i in range(num_workers)] for t in range(num_tasks)]
+
+    with open("enc_worker_data.pkl", "wb") as f:
+        pickle.dump({
+            "pubkey": pubkey,
+            "costs": enc_costs,
+            "quals": enc_quals,
+            "raw_costs": raw_costs,
+            "raw_quals": raw_quals
+        }, f)
+
+    with open("threshold_key_shares.pkl", "wb") as f:
+        pickle.dump({
+            "share0": share0,
+            "share1": share1,
+            "mu": mu,
+            "n": n,
+            "n_sq": n_sq
+        }, f)
+
+    print("✅ 多任务加密数据上传成功")
+
+def save_all_solutions(obj_list, share0, share1, pubkey, mu, n, n_sq, output_file="all_solutions.txt"):
+    """
+    保存所有解的分配情况及其解密后的成本和质量。
+    """
+    lines = []
+    for idx, (x, enc_cost, enc_qual) in enumerate(obj_list):
+        # 解密
+        dec_cost = combine_shares(
+            partial_decrypt(enc_cost, share0, pubkey, n_sq),
+            partial_decrypt(enc_cost, share1, pubkey, n_sq),
+            mu, n
+        )
+        dec_qual = combine_shares(
+            partial_decrypt(enc_qual, share0, pubkey, n_sq),
+            partial_decrypt(enc_qual, share1, pubkey, n_sq),
+            mu, n
+        )
+        lines.append(f"🧬 个体 {idx+1}:\n")
+        for t, row in enumerate(x):
+            lines.append(f"  任务{t+1}: {row}\n")
+        lines.append(f"  📉 解密成本: {dec_cost}\n")
+        lines.append(f"  📈 解密质量: {dec_qual}\n")
+        lines.append("-" * 40 + "\n")
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+    print(f"\n📁 所有个体解及解密目标已保存至：{output_file}")
 
 # -------------------------------
 # 主优化器（支持阈值解密 + 分配约束）
@@ -610,12 +669,9 @@ def run_moeo_wcd(pubkey, enc_costs, enc_quals,
     N = len(enc_costs[0])  # 工人数
     T = num_tasks
 
-    # ✅ 初始化种群
     population = [generate_random_matrix(T, N, min_assign=min_assign) for _ in range(pop_size)]
 
-    # ✅ 迭代进化
     for gen in tqdm(range(num_iter), desc="🌱 进化轮"):
-        # ✅ 并行评估种群个体
         obj_list = parallel_evaluate_population(
             population=population,
             enc_costs=enc_costs,
@@ -627,22 +683,19 @@ def run_moeo_wcd(pubkey, enc_costs, enc_quals,
             n=n,
             n_sq=n_sq,
             min_assign=min_assign,
-            fast_mode=False  # ✅ 若为 True，跳过密文目标，快速估算
+            fast_mode=fast_mode
         )
 
-        # ✅ 非支配排序 + 拥塞距离
         fronts = fast_non_dominated_sort_enc(obj_list, pubkey, share0, share1, mu, n, n_sq)
         crowding = compute_weighted_crowding_distance(obj_list, population, fronts[0],
                                                       pubkey, share0, share1, mu, n, n_sq,
                                                       alpha=0.5)
 
-        # ✅ 精英选择并生成新一代
         elite_indices = integrate_elite_selection(
             population, crowding, pop_size // 2, pubkey, share0, share1, mu, n, n_sq
         )
         new_population = [population[i] for i in elite_indices]
 
-        # 🧬 变异补足
         while len(new_population) < pop_size:
             parent = random.choice(new_population)
             child = mutate_matrix(parent)
@@ -650,20 +703,26 @@ def run_moeo_wcd(pubkey, enc_costs, enc_quals,
 
         population = new_population
 
-    # 🏁 最终选择成本最小者
-    best_idx = select_argmax_enc(
-        [(i, obj_list[i][1]) for i in range(len(population))],
-        pubkey=pubkey, share0=share0, share1=share1, mu=mu, n=n, n_sq=n_sq
+    best_idx = select_best_by_custom_score(
+        obj_list=obj_list,
+        share0=share0,
+        share1=share1,
+        pubkey=pubkey,
+        mu=mu,
+        n=n,
+        n_sq=n_sq,
+        alpha=0.7,
+        beta=0.3
     )
 
-    best_x = population[best_idx]
-    best_cost = obj_list[best_idx][1]
-    best_qual = obj_list[best_idx][2]
+    # ✅ 改正：统一从 obj_list 中取 x/cost/qual
+    best_x, best_cost, best_qual = obj_list[best_idx]
+
 
     print("\n✅ 优化完成，最优分配方案如下：")
     for t in range(T):
         print(f"  任务{t+1}: {best_x[t]}")
-    return best_x, best_cost, best_qual
+    return best_x, best_cost, best_qual, obj_list  # ✅ 返回全部解列表
 
 
 
@@ -672,7 +731,7 @@ def run_moeo_wcd(pubkey, enc_costs, enc_quals,
 # 工人数据准备 + 平台密钥加载
 # -----------------------------
 def prepare_data(num_tasks, num_workers):
-    simulate_worker_upload(num_tasks=num_tasks, num_workers=num_workers)
+    simulate_worker_upload1(num_tasks=num_tasks, num_workers=num_workers)
 
     with open('enc_worker_data.pkl', 'rb') as f:
         data = pickle.load(f)
@@ -820,24 +879,20 @@ def load_offline_cache():
 # -----------------------------
 def main():
     print("🔐 加密众包优化系统启动...")
-    start_time = time.time()  # ⏱️ 开始计时
+    start_time = time.time()
     if os.path.exists("enc_worker_data.pkl"):
         os.remove("enc_worker_data.pkl")
     if os.path.exists("threshold_key_shares.pkl"):
         os.remove("threshold_key_shares.pkl")
 
-
-    # ✅ 设置多任务参数
-    num_tasks = 3       # ⬅️ 任务数，可自定义
+    # ✅ 参数设置
+    num_tasks = 3
     num_workers = 5
-    min_assign = 1        # 每个任务最少分配工人数
-    num_iter = 3        # 进化代数
-    pop_size = 5       # 每代个体数
+    min_assign = 1
+    num_iter = 2
+    pop_size = 5
 
-    # ✅ 生成密文数据（带参数）
-    simulate_worker_upload(num_tasks=num_tasks, num_workers=num_workers)
-
-    # ✅ 加载数据与密钥（带参数）
+    simulate_worker_upload1(num_tasks=num_tasks, num_workers=num_workers)
     pubkey, enc_costs, enc_quals, share0, share1, mu, n, n_sq, raw_costs, raw_quals = \
         prepare_data(num_tasks=num_tasks, num_workers=num_workers)
 
@@ -848,8 +903,8 @@ def main():
     for t in range(num_tasks):
         print(f"任务 {t+1}: {raw_quals[t]}")
 
-    # 🔁 启动多任务多目标优化
-    best_x, enc_best_cost, enc_best_qual = run_moeo_wcd(
+    # ✅ 启动优化
+    best_x, enc_best_cost, enc_best_qual, obj_list = run_moeo_wcd(
         pubkey=pubkey,
         enc_costs=enc_costs,
         enc_quals=enc_quals,
@@ -861,17 +916,15 @@ def main():
         num_iter=num_iter,
         pop_size=pop_size,
         num_tasks=num_tasks,
-        min_assign=min_assign
+        min_assign=min_assign,
+        fast_mode=False
     )
 
-    print(f"\n✅ 最终任务分配方案（每行代表一个任务）：")
+    print(f"\n✅ 最终任务分配方案：")
     for t, task_assign in enumerate(best_x):
         print(f"任务 {t+1}: {task_assign}")
 
-    # 🔓 解密目标值（重新评估以确保一致）
-    enc_best_cost = evaluate_cost_stable(best_x, enc_costs, pubkey)
-    enc_best_qual = evaluate_quality_stable(best_x, enc_quals, pubkey)
-
+    # ✅ 解密最终目标值
     dec_best_cost = combine_shares(
         partial_decrypt(enc_best_cost, share0, pubkey, n_sq),
         partial_decrypt(enc_best_cost, share1, pubkey, n_sq),
@@ -886,10 +939,13 @@ def main():
     print(f"\n🔓 解密后目标值：")
     print(f"📉 总成本 = {dec_best_cost}")
     print(f"📈 总质量 = {dec_best_qual}")
-    end_time = time.time()
-    elapsed = end_time - start_time
-    print(f"\n⏱️ 本次运行总耗时：{elapsed:.2f} 秒")
 
-# -----------------------------
+    # ✅ 保存所有个体解
+    save_all_solutions(obj_list, share0, share1, pubkey, mu, n, n_sq)
+
+    print(f"\n⏱️ 本次运行耗时：{time.time() - start_time:.2f} 秒")
+
+
+# ✅ 程序入口
 if __name__ == "__main__":
     main()

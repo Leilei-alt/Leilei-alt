@@ -828,11 +828,11 @@ def main():
 
 
     # ✅ 设置多任务参数
-    num_tasks = 3         # ⬅️ 任务数，可自定义
-    num_workers = 6
-    min_assign = 2        # 每个任务最少分配工人数
-    num_iter = 2         # 进化代数
-    pop_size = 10       # 每代个体数
+    num_tasks = 3       # ⬅️ 任务数，可自定义
+    num_workers = 5
+    min_assign = 1        # 每个任务最少分配工人数
+    num_iter = 3        # 进化代数
+    pop_size = 5       # 每代个体数
 
     # ✅ 生成密文数据（带参数）
     simulate_worker_upload(num_tasks=num_tasks, num_workers=num_workers)

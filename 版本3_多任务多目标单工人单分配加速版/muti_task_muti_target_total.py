@@ -57,69 +57,11 @@ def decrypt_list(private_key, encrypted_values):
     """
     return [private_key.decrypt(x) for x in encrypted_values]
 
-# ----------------------------------------------------
-# 📌 Fast Non-Dominated Sorting
-# 输入：二维列表 obj_values，每个元素是一个个体的 [目标1, 目标2]
-# 输出：Pareto 层级列表 fronts，每一层包含个体索引
-# ----------------------------------------------------
 
-def fast_non_dominated_sort_enc(obj_list, pubkey, share0, share1, mu, n, n_sq):
-    """
-    使用密文比较完成非支配排序过程，适用于 encrypted obj_list。
-    每个 obj_list[i] 是加密后的目标值列表。
-    返回：fronts（List[List[int]]）多层非支配解索引
-    """
-    S = {}         # 支配集合
-    n_dom = {}     # 被支配次数
-    fronts = [[]]  # 非支配层
-
-    for p in range(len(obj_list)):
-        S[p] = []
-        n_dom[p] = 0
-        for q in range(len(obj_list)):
-            if p == q:
-                continue
-            if dominates_enc(obj_list[p], obj_list[q], pubkey, share0, share1, mu, n, n_sq):
-                S[p].append(q)
-            elif dominates_enc(obj_list[q], obj_list[p], pubkey, share0, share1, mu, n, n_sq):
-                n_dom[p] += 1
-        if n_dom[p] == 0:
-            fronts[0].append(p)
-
-    i = 0
-    while len(fronts[i]) > 0:
-        next_front = []
-        for p in fronts[i]:
-            for q in S[p]:
-                n_dom[q] -= 1
-                if n_dom[q] == 0:
-                    next_front.append(q)
-        i += 1
-        fronts.append(next_front)
-
-    # 去掉最后一个空层
-    if len(fronts[-1]) == 0:
-        fronts.pop()
-    return fronts
 
 
 #上面的重构版本
-def dominates_enc(ind1, ind2, pubkey, share0, share1, mu, n, n_sq):
-    enc_cost1, enc_qual1 = ind1[1], ind1[2]
-    enc_cost2, enc_qual2 = ind2[1], ind2[2]
 
-    comp1 = secure_compare(enc_cost1, enc_cost2, pubkey, share0, share1, mu, n, n_sq)
-    comp2 = secure_compare(enc_qual2, enc_qual1, pubkey, share0, share1, mu, n, n_sq)
-
-    u01 = partial_decrypt(comp1, share0, pubkey, n_sq)
-    u02 = partial_decrypt(comp2, share0, pubkey, n_sq)
-    u11 = partial_decrypt(comp1, share1, pubkey, n_sq)
-    u12 = partial_decrypt(comp2, share1, pubkey, n_sq)
-
-    b1 = combine_shares(u01, u11, mu, n)  # cost1 < cost2
-    b2 = combine_shares(u02, u12, mu, n)  # qual1 > qual2
-
-    return b1 == 1 and b2 == 1
 
 
 
@@ -197,36 +139,7 @@ def calculate_crowding_distance_enc(front, obj_list, pubkey, share0, share1, mu,
 
     return distance
 
-def compute_weighted_crowding_distance(obj_list, population, front_indices,
-                                       pubkey, share0, share1, mu, n, n_sq,
-                                       alpha=0.5):
-    """
-    使用加权替代策略计算密文拥塞距离（无需排序）：
-    EncCrowding = α × (enc_max_cost - enc_cost) + (1 - α) × enc_qual
-    """
-    enc_costs = [obj_list[i][1] for i in front_indices]
-    enc_quals = [obj_list[i][2] for i in front_indices]
 
-    # 👑 先选出 enc_max_cost
-    max_cost_idx = select_argmax_enc(list(zip(front_indices, enc_costs)),
-                                     pubkey, share0, share1, mu, n, n_sq)
-    enc_max_cost = obj_list[max_cost_idx][1]
-
-    crowding_dict = {}
-
-    for i in front_indices:
-        enc_cost = obj_list[i][1]
-        enc_qual = obj_list[i][2]
-
-        # ➗ crowding = α*(max_cost - cost) + (1-α)*qual
-        enc_diff = enc_max_cost - enc_cost
-        enc_part1 = enc_diff * alpha
-        enc_part2 = enc_qual * (1 - alpha)
-        enc_crowding = enc_part1 + enc_part2
-
-        crowding_dict[i] = enc_crowding
-
-    return crowding_dict
 
 
 
@@ -297,43 +210,6 @@ def combine_shares(u0, u1, mu, n, max_bits=4096):
 
 
 
-
-# -------------------------------
-# 密文目标函数评估
-# -------------------------------
-def evaluate_cost_stable(x, enc_costs, pubkey):
-    T = len(x)
-    N = len(x[0])
-
-    # ✅ 正确初始化密文加法
-    total_cost = None
-    for t in range(T):
-        for i in range(N):
-            if x[t][i] == 1:
-                if total_cost is None:
-                    total_cost = enc_costs[t][i]
-                else:
-                    total_cost += enc_costs[t][i]
-    return total_cost if total_cost else pubkey.encrypt(0)
-
-
-def evaluate_quality_stable(x, enc_quals, pubkey):
-    T = len(x)
-    N = len(x[0])
-
-    total_qual = None
-    for t in range(T):
-        for i in range(N):
-            if x[t][i] == 1:
-                if total_qual is None:
-                    total_qual = enc_quals[t][i]
-                else:
-                    total_qual += enc_quals[t][i]
-    return total_qual if total_qual else pubkey.encrypt(0)
-
-
-
-
 # -------------------------------
 # 随机解生成与变异
 # -------------------------------
@@ -374,43 +250,82 @@ def generate_random_matrix(num_tasks, num_workers, min_assign=2):
 
 
 
-def mutate_solution(x):
-    return [1 - xi if random.random() < 0.1 else xi for xi in x]
+# ----------------------------------------------------
+# 📌 Fast Non-Dominated Sorting
+# 输入：二维列表 obj_values，每个元素是一个个体的 [目标1, 目标2]
+# 输出：Pareto 层级列表 fronts，每一层包含个体索引
+# ----------------------------------------------------
 
-#密文Top-k选择器
-def select_topk_by_enc_value(enc_dict, k, pubkey, share0, share1, mu, n, n_sq):
+def fast_non_dominated_sort_enc(obj_list, pubkey, share0, share1, mu, n, n_sq):
     """
-    从加密值字典中选择 Top-k 的索引（基于密文比较）。
-    enc_dict: {index: Enc(value)}
-    返回：长度为 ≤ k 的索引列表（按密文最大值优先）
+    使用密文比较完成非支配排序过程，适用于 encrypted obj_list。
+    每个 obj_list[i] 是加密后的目标值列表。
+    返回：fronts（List[List[int]]）多层非支配解索引
     """
-    selected = []
-    remaining = list(enc_dict.keys())
+    S = {}         # 支配集合
+    n_dom = {}     # 被支配次数
+    fronts = [[]]  # 非支配层
 
-    while len(selected) < k and remaining:
-        max_idx = remaining[0]
-        for i in remaining[1:]:
-            comp = secure_compare(enc_dict[i], enc_dict[max_idx], pubkey, share0, share1, mu, n, n_sq)
-            u0 = partial_decrypt(comp, share0, pubkey, n_sq)
-            u1 = partial_decrypt(comp, share1, pubkey, n_sq)
-            result = combine_shares(u0, u1, mu, n)
-            if result == 1:
-                max_idx = i
+    for p in range(len(obj_list)):
+        S[p] = []
+        n_dom[p] = 0
+        for q in range(len(obj_list)):
+            if p == q:
+                continue
+            if dominates_enc(obj_list[p], obj_list[q], pubkey, share0, share1, mu, n, n_sq):
+                S[p].append(q)
+            elif dominates_enc(obj_list[q], obj_list[p], pubkey, share0, share1, mu, n, n_sq):
+                n_dom[p] += 1
+        if n_dom[p] == 0:
+            fronts[0].append(p)
 
-        selected.append(max_idx)
-        remaining.remove(max_idx)
+    i = 0
+    while len(fronts[i]) > 0:
+        next_front = []
+        for p in fronts[i]:
+            for q in S[p]:
+                n_dom[q] -= 1
+                if n_dom[q] == 0:
+                    next_front.append(q)
+        i += 1
+        fronts.append(next_front)
 
-    return selected
+    # 去掉最后一个空层
+    if len(fronts[-1]) == 0:
+        fronts.pop()
+    return fronts
 
+def compute_weighted_crowding_distance(obj_list, population, front_indices,
+                                       pubkey, share0, share1, mu, n, n_sq,
+                                       alpha=0.5):
+    """
+    使用加权替代策略计算密文拥塞距离（无需排序）：
+    EncCrowding = α × (enc_max_cost - enc_cost) + (1 - α) × enc_qual
+    """
+    enc_costs = [obj_list[i][1] for i in front_indices]
+    enc_quals = [obj_list[i][2] for i in front_indices]
 
-#字典为空时随机返回 k 个键（用于补全）
-def select_random_if_empty(enc_dict, k):
-    """如果密文字典为空，则随机选择 k 个索引作为后备方案。"""
-    all_indices = list(enc_dict.keys())
-    if not all_indices:
-        print("⚠️ 后备选择：字典为空，返回空列表")
-        return []
-    return random.sample(all_indices, min(k, len(all_indices)))
+    # 👑 先选出 enc_max_cost
+    max_cost_idx = select_argmax_enc(list(zip(front_indices, enc_costs)),
+                                     pubkey, share0, share1, mu, n, n_sq)
+    enc_max_cost = obj_list[max_cost_idx][1]
+
+    crowding_dict = {}
+
+    for i in front_indices:
+        enc_cost = obj_list[i][1]
+        enc_qual = obj_list[i][2]
+
+        # ➗ crowding = α*(max_cost - cost) + (1-α)*qual
+        enc_diff = enc_max_cost - enc_cost
+        enc_part1 = enc_diff * alpha
+        enc_part2 = enc_qual * (1 - alpha)
+        enc_crowding = enc_part1 + enc_part2
+
+        crowding_dict[i] = enc_crowding
+
+    return crowding_dict
+
 
 #综合使用密文选择 + 随机补全：
 def integrate_elite_selection(population, crowding_dict, k, pubkey, share0, share1, mu, n, n_sq):
@@ -424,23 +339,33 @@ def integrate_elite_selection(population, crowding_dict, k, pubkey, share0, shar
         elite_indices += supplement
     return elite_indices
 
-
-#密文Argmax选择器
-def select_argmax_enc(index_value_pairs, pubkey, share0, share1, mu, n, n_sq):
+#目标是：对每个任务-工人位置 x[t][i] 以一定概率（例如 10%）进行翻转（0 ↔ 1），模拟“基因突变”。
+def mutate_matrix(x, mutation_prob=0.1):
     """
-    从 (index, enc_value) 列表中选出最大值对应索引
+    多任务分配矩阵的变异函数（保持工人唯一性）。
+    :param x: T×N 矩阵
+    :return: 新个体
     """
-    max_index, max_enc = index_value_pairs[0]
+    T = len(x)
+    N = len(x[0])
+    new_x = [[0 for _ in range(N)] for _ in range(T)]
 
-    for idx, enc in index_value_pairs[1:]:
-        enc_cmp = secure_compare(enc, max_enc, pubkey, share0, share1, mu, n, n_sq)
-        u0 = partial_decrypt(enc_cmp, share0, pubkey, n_sq)
-        u1 = partial_decrypt(enc_cmp, share1, pubkey, n_sq)
-        bit = combine_shares(u0, u1, mu, n)
-        if bit == 1:
-            max_index, max_enc = idx, enc
+    for i in range(N):
+        if random.random() < mutation_prob:
+            # 以一定概率重新分配给一个新任务或空任务
+            new_task = random.choice(range(T + 1))
+            if new_task < T:
+                new_x[new_task][i] = 1
+            # 否则全 0，表示不参与任何任务
+        else:
+            # 保留原始任务分配（最多一个）
+            for t in range(T):
+                if x[t][i] == 1:
+                    new_x[t][i] = 1
+                    break
 
-    return max_index
+    return new_x
+
 
 def select_best_by_custom_score(obj_list, share0, share1, pubkey, mu, n, n_sq, alpha=0.7, beta=0.3, eps=1e-6):
     """
@@ -469,32 +394,39 @@ def select_best_by_custom_score(obj_list, share0, share1, pubkey, mu, n, n_sq, a
     return best_idx
 
 
-#目标是：对每个任务-工人位置 x[t][i] 以一定概率（例如 10%）进行翻转（0 ↔ 1），模拟“基因突变”。
-def mutate_matrix(x, mutation_prob=0.1):
-    """
-    多任务分配矩阵的变异函数（保持工人唯一性）。
-    :param x: T×N 矩阵
-    :return: 新个体
-    """
+# -------------------------------
+# 密文目标函数评估
+# -------------------------------
+def evaluate_cost_stable(x, enc_costs, pubkey):
     T = len(x)
     N = len(x[0])
-    new_x = [[0 for _ in range(N)] for _ in range(T)]
 
-    for i in range(N):
-        if random.random() < mutation_prob:
-            # 以一定概率重新分配给一个新任务或空任务
-            new_task = random.choice(range(T + 1))
-            if new_task < T:
-                new_x[new_task][i] = 1
-            # 否则全 0，表示不参与任何任务
-        else:
-            # 保留原始任务分配（最多一个）
-            for t in range(T):
-                if x[t][i] == 1:
-                    new_x[t][i] = 1
-                    break
+    # ✅ 正确初始化密文加法
+    total_cost = None
+    for t in range(T):
+        for i in range(N):
+            if x[t][i] == 1:
+                if total_cost is None:
+                    total_cost = enc_costs[t][i]
+                else:
+                    total_cost += enc_costs[t][i]
+    return total_cost if total_cost else pubkey.encrypt(0)
 
-    return new_x
+
+def evaluate_quality_stable(x, enc_quals, pubkey):
+    T = len(x)
+    N = len(x[0])
+
+    total_qual = None
+    for t in range(T):
+        for i in range(N):
+            if x[t][i] == 1:
+                if total_qual is None:
+                    total_qual = enc_quals[t][i]
+                else:
+                    total_qual += enc_quals[t][i]
+    return total_qual if total_qual else pubkey.encrypt(0)
+
 
 def evaluate_individual_parallel(x, enc_costs, enc_quals, pubkey, share0, share1, mu, n, n_sq, min_assign, fast_mode=False):
     T = len(x)
@@ -549,6 +481,88 @@ def parallel_evaluate_population(population, enc_costs, enc_quals, pubkey, share
         results = [f.result() for f in tqdm(futures, desc="⏳ 并行评估中")]
 
     return results
+
+""""
+def mutate_solution(x):
+    return [1 - xi if random.random() < 0.1 else xi for xi in x]
+"""
+
+def dominates_enc(ind1, ind2, pubkey, share0, share1, mu, n, n_sq):
+    enc_cost1, enc_qual1 = ind1[1], ind1[2]
+    enc_cost2, enc_qual2 = ind2[1], ind2[2]
+
+    comp1 = secure_compare(enc_cost1, enc_cost2, pubkey, share0, share1, mu, n, n_sq)
+    comp2 = secure_compare(enc_qual2, enc_qual1, pubkey, share0, share1, mu, n, n_sq)
+
+    u01 = partial_decrypt(comp1, share0, pubkey, n_sq)
+    u02 = partial_decrypt(comp2, share0, pubkey, n_sq)
+    u11 = partial_decrypt(comp1, share1, pubkey, n_sq)
+    u12 = partial_decrypt(comp2, share1, pubkey, n_sq)
+
+    b1 = combine_shares(u01, u11, mu, n)  # cost1 < cost2
+    b2 = combine_shares(u02, u12, mu, n)  # qual1 > qual2
+
+    return b1 == 1 and b2 == 1
+
+
+#使用密文比较获取最大前k个
+def select_topk_by_enc_value(enc_dict, k, pubkey, share0, share1, mu, n, n_sq):
+    """
+    从加密值字典中选择 Top-k 的索引（基于密文比较）。
+    enc_dict: {index: Enc(value)}
+    返回：长度为 ≤ k 的索引列表（按密文最大值优先）
+    """
+    selected = []
+    remaining = list(enc_dict.keys())
+
+    while len(selected) < k and remaining:
+        max_idx = remaining[0]
+        for i in remaining[1:]:
+            comp = secure_compare(enc_dict[i], enc_dict[max_idx], pubkey, share0, share1, mu, n, n_sq)
+            u0 = partial_decrypt(comp, share0, pubkey, n_sq)
+            u1 = partial_decrypt(comp, share1, pubkey, n_sq)
+            result = combine_shares(u0, u1, mu, n)
+            if result == 1:
+                max_idx = i
+
+        selected.append(max_idx)
+        remaining.remove(max_idx)
+
+    return selected
+
+
+#密文Argmax选择器
+def select_argmax_enc(index_value_pairs, pubkey, share0, share1, mu, n, n_sq):
+    """
+    从 (index, enc_value) 列表中选出最大值对应索引
+    """
+    max_index, max_enc = index_value_pairs[0]
+
+    for idx, enc in index_value_pairs[1:]:
+        enc_cmp = secure_compare(enc, max_enc, pubkey, share0, share1, mu, n, n_sq)
+        u0 = partial_decrypt(enc_cmp, share0, pubkey, n_sq)
+        u1 = partial_decrypt(enc_cmp, share1, pubkey, n_sq)
+        bit = combine_shares(u0, u1, mu, n)
+        if bit == 1:
+            max_index, max_enc = idx, enc
+
+    return max_index
+
+
+#字典为空时随机返回 k 个键（用于补全）
+def select_random_if_empty(enc_dict, k):
+    """如果密文字典为空，则随机选择 k 个索引作为后备方案。"""
+    all_indices = list(enc_dict.keys())
+    if not all_indices:
+        print("⚠️ 后备选择：字典为空，返回空列表")
+        return []
+    return random.sample(all_indices, min(k, len(all_indices)))
+
+
+
+
+
+
 
 def simulate_worker_upload(num_tasks=3, num_workers=6):
     keys = generate_threshold_keypair()
@@ -625,6 +639,25 @@ def simulate_worker_upload1(num_tasks=3, num_workers=6):
         }, f)
 
     print("✅ 多任务加密数据上传成功")
+
+# -----------------------------
+# 工人数据准备 + 平台密钥加载
+# -----------------------------
+def prepare_data(num_tasks, num_workers):
+    simulate_worker_upload1(num_tasks=num_tasks, num_workers=num_workers)
+
+    with open('enc_worker_data.pkl', 'rb') as f:
+        data = pickle.load(f)
+    with open('threshold_key_shares.pkl', 'rb') as f:
+        key_parts = pickle.load(f)
+
+    return (
+        data['pubkey'], data['costs'], data['quals'],
+        key_parts['share0'], key_parts['share1'],
+        key_parts['mu'], key_parts['n'], key_parts['n_sq'],
+        data['raw_costs'], data['raw_quals']
+    )
+
 
 def save_all_solutions(obj_list, share0, share1, pubkey, mu, n, n_sq, output_file="all_solutions.txt"):
     """
@@ -727,23 +760,6 @@ def run_moeo_wcd(pubkey, enc_costs, enc_quals,
 
 
 
-# -----------------------------
-# 工人数据准备 + 平台密钥加载
-# -----------------------------
-def prepare_data(num_tasks, num_workers):
-    simulate_worker_upload1(num_tasks=num_tasks, num_workers=num_workers)
-
-    with open('enc_worker_data.pkl', 'rb') as f:
-        data = pickle.load(f)
-    with open('threshold_key_shares.pkl', 'rb') as f:
-        key_parts = pickle.load(f)
-
-    return (
-        data['pubkey'], data['costs'], data['quals'],
-        key_parts['share0'], key_parts['share1'],
-        key_parts['mu'], key_parts['n'], key_parts['n_sq'],
-        data['raw_costs'], data['raw_quals']
-    )
 
 
 #手动开方
@@ -889,7 +905,7 @@ def main():
     num_tasks = 3
     num_workers = 5
     min_assign = 1
-    num_iter = 2
+    num_iter = 3
     pop_size = 5
 
     simulate_worker_upload1(num_tasks=num_tasks, num_workers=num_workers)

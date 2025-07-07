@@ -981,7 +981,10 @@ def main():
     simulate_worker_upload(num_tasks=num_tasks, num_workers=num_workers)
     pubkey, enc_costs, enc_quals, enc_weights, share0, share1, mu, n, n_sq, raw_costs, raw_quals, raw_weights = \
         prepare_data(num_tasks=num_tasks, num_workers=num_workers)
-
+    
+    print("\n📌 工人成本权重向量:")
+    print(raw_weights)
+    
     print("\n📌 明文成本矩阵:")
     for t in range(num_tasks):
         print(f"任务 {t+1}: {raw_costs[t]}")

@@ -5,6 +5,7 @@ import pickle
 import os
 import math
 import time
+from functools import partial
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
 # 模拟辅助服务器 S1 的比较服务
@@ -423,20 +424,23 @@ def select_best_by_custom_score(obj_list, share0, share1, pubkey, mu, n, n_sq, a
 # -------------------------------
 # 密文目标函数评估
 # -------------------------------
-def evaluate_cost_stable(x, enc_costs, pubkey):
+def evaluate_cost_stable_smulg(x, enc_costs, enc_weights, pubkey, share0, share1, mu, n, n_sq):
     T = len(x)
     N = len(x[0])
 
-    # ✅ 正确初始化密文加法
     total_cost = None
     for t in range(T):
         for i in range(N):
             if x[t][i] == 1:
+                enc_c = enc_costs[t][i]
+                enc_w = enc_weights[i]
+                enc_weighted_cost = secure_multiply(enc_c, enc_w, pubkey, share0, share1, mu, n, n_sq)
                 if total_cost is None:
-                    total_cost = enc_costs[t][i]
+                    total_cost = enc_weighted_cost
                 else:
-                    total_cost += enc_costs[t][i]
+                    total_cost += enc_weighted_cost
     return total_cost if total_cost else pubkey.encrypt(0)
+
 
 
 def evaluate_quality_stable(x, enc_quals, pubkey):
@@ -454,7 +458,7 @@ def evaluate_quality_stable(x, enc_quals, pubkey):
     return total_qual if total_qual else pubkey.encrypt(0)
 
 
-def evaluate_individual_parallel(x, enc_costs, enc_quals, pubkey, share0, share1, mu, n, n_sq, min_assign, fast_mode=False):
+def evaluate_individual_parallel(x, enc_costs, enc_quals, enc_weights, pubkey, share0, share1, mu, n, n_sq, min_assign, fast_mode=False):
     T = len(x)
     N = len(x[0])
     valid = True
@@ -477,36 +481,35 @@ def evaluate_individual_parallel(x, enc_costs, enc_quals, pubkey, share0, share1
         enc_cost = pubkey.encrypt(999999)
         enc_qual = pubkey.encrypt(0)
     else:
-        enc_cost = evaluate_cost_stable(x, enc_costs, pubkey)
+        enc_cost = evaluate_cost_stable_smulg(x, enc_costs, enc_weights, pubkey, share0, share1, mu, n, n_sq)
         enc_qual = evaluate_quality_stable(x, enc_quals, pubkey)
 
     return (x, enc_cost, enc_qual)
 
-def parallel_evaluate_population(population, enc_costs, enc_quals, pubkey, share0, share1, mu, n, n_sq, min_assign, fast_mode=False):
-    from functools import partial
-    from concurrent.futures import ProcessPoolExecutor
-    from tqdm import tqdm
-
-    # 用 functools.partial 封装公共参数
-    func = partial(
-        evaluate_individual_parallel,
-        enc_costs=enc_costs,
-        enc_quals=enc_quals,
-        pubkey=pubkey,
-        share0=share0,
-        share1=share1,
-        mu=mu,
-        n=n,
-        n_sq=n_sq,
-        min_assign=min_assign,
-        fast_mode=fast_mode
-    )
-
-    with ProcessPoolExecutor() as executor:
-        futures = [executor.submit(func, x) for x in population]
-        results = [f.result() for f in tqdm(futures, desc="⏳ 并行评估中")]
-
+def parallel_evaluate_population(population, enc_costs, enc_quals, enc_weights,
+                                 pubkey, share0, share1, mu, n, n_sq,
+                                 min_assign, fast_mode=False):
+    # ✅ 直接串行遍历
+    results = []
+    for x in tqdm(population, desc="🔁 串行评估中"):
+        result = evaluate_individual_parallel(
+            x=x,
+            enc_costs=enc_costs,
+            enc_quals=enc_quals,
+            enc_weights=enc_weights,
+            pubkey=pubkey,
+            share0=share0,
+            share1=share1,
+            mu=mu,
+            n=n,
+            n_sq=n_sq,
+            min_assign=min_assign,
+            fast_mode=fast_mode
+        )
+        results.append(result)
     return results
+
+
 
 
 
@@ -594,13 +597,18 @@ def simulate_worker_upload(num_tasks=3, num_workers=6):
     enc_costs = [[encrypt(pubkey, raw_costs[t][i]) for i in range(num_workers)] for t in range(num_tasks)]
     enc_quals = [[encrypt(pubkey, raw_quals[t][i]) for i in range(num_workers)] for t in range(num_tasks)]
 
+    raw_weights = [random.randint(1, 5) for _ in range(num_workers)]  # 可换为浮点权重
+    enc_weights = [encrypt(pubkey, w) for w in raw_weights]
+
     with open("enc_worker_data.pkl", "wb") as f:
         pickle.dump({
             "pubkey": pubkey,
             "costs": enc_costs,
             "quals": enc_quals,
             "raw_costs": raw_costs,
-            "raw_quals": raw_quals
+            "raw_quals": raw_quals,
+            "enc_weights": enc_weights,  # ✅ 新增字段
+            "raw_weights": raw_weights
         }, f)
 
     with open("threshold_key_shares.pkl", "wb") as f:
@@ -674,10 +682,10 @@ def prepare_data(num_tasks, num_workers):
         key_parts = pickle.load(f)
 
     return (
-        data['pubkey'], data['costs'], data['quals'],
+        data['pubkey'], data['costs'], data['quals'], data['enc_weights'],  # ✅ 添加 enc_weights
         key_parts['share0'], key_parts['share1'],
         key_parts['mu'], key_parts['n'], key_parts['n_sq'],
-        data['raw_costs'], data['raw_quals']
+        data['raw_costs'], data['raw_quals'], data['raw_weights']
     )
 
 
@@ -781,7 +789,7 @@ def update_with_ceq(parent, ceq_pool, lambda_=1.0):
 # -------------------------------
 # 主优化器（支持阈值解密 + 分配约束）
 # -------------------------------
-def run_moeo_wcd(pubkey, enc_costs, enc_quals,
+def run_moeo_wcd(pubkey, enc_costs, enc_quals, enc_weights,
                  share0, share1, mu, n, n_sq,
                  num_iter=30, pop_size=20,
                  num_tasks=3, min_assign=2,
@@ -799,6 +807,7 @@ def run_moeo_wcd(pubkey, enc_costs, enc_quals,
             population=population,
             enc_costs=enc_costs,
             enc_quals=enc_quals,
+            enc_weights=enc_weights,  # ✅ 添加 enc_weights
             pubkey=pubkey,
             share0=share0,
             share1=share1,
@@ -945,7 +954,7 @@ def secure_compare(enc_x, enc_y, pubkey, share0, share1, mu, n, n_sq):
 
 
 #离线加载缓存
-def generate_offline_cache(pubkey, num_sets=100):
+def generate_offline_cache(pubkey, num_sets=150):
     """
     离线阶段生成密文扰动缓存元组：包括 enc(r1), enc(r2), enc(-r1*r2), enc(0), enc(1)
     限制 r1*r2 的大小，避免溢出 ValueError。
@@ -1019,14 +1028,18 @@ def get_next_cache(pubkey=None, refill_num=100):
 # -----------------------------
 def main():
 
-    global offline_cache, offline_ptr
-
-    print("🔐 加密众包优化系统启动...")
-
     if os.path.exists("enc_worker_data.pkl"):
         os.remove("enc_worker_data.pkl")
     if os.path.exists("threshold_key_shares.pkl"):
         os.remove("threshold_key_shares.pkl")
+    if os.path.exists("offline_cache.pkl"):
+        os.remove("offline_cache.pkl")  # ✅ 强制删除旧缓存
+
+    global offline_cache, offline_ptr
+
+    print("🔐 加密众包优化系统启动...")
+
+
 
     # ✅ 参数设置
     num_tasks = 5
@@ -1036,8 +1049,11 @@ def main():
     pop_size = 3
 
     simulate_worker_upload(num_tasks=num_tasks, num_workers=num_workers)
-    pubkey, enc_costs, enc_quals, share0, share1, mu, n, n_sq, raw_costs, raw_quals = \
+    pubkey, enc_costs, enc_quals, enc_weights, share0, share1, mu, n, n_sq, raw_costs, raw_quals, raw_weights = \
         prepare_data(num_tasks=num_tasks, num_workers=num_workers)
+
+    print("\n📌 工人成本权重向量:")
+    print(raw_weights)
 
     # ✅ 离线扰动缓存生成/加载
     """
@@ -1046,7 +1062,7 @@ def main():
     """
     # ✅ 离线扰动缓存生成/加载（此处再加载）
     if not os.path.exists("offline_cache.pkl"):
-        generate_offline_cache(pubkey, num_sets=100)
+        generate_offline_cache(pubkey, num_sets=150)
 
     offline_cache = load_offline_cache()
     offline_ptr = 0
@@ -1067,6 +1083,7 @@ def main():
         pubkey=pubkey,
         enc_costs=enc_costs,
         enc_quals=enc_quals,
+        enc_weights=enc_weights,  # ✅ 添加权重
         share0=share0,
         share1=share1,
         mu=mu,

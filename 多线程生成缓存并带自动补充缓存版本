@@ -7,61 +7,8 @@ import math
 import time
 from functools import partial
 from concurrent.futures import ProcessPoolExecutor
-#离线加载缓存
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
-# 模拟辅助服务器 S1 的比较服务
-
-def s1_compare_encrypted(enc_a, enc_b, privkey):
-    """
-    模拟 S1 服务器对两个 Paillier 密文执行比较 a < b 的判断。
-    :param enc_a: EncryptedNumber
-    :param enc_b: EncryptedNumber
-    :param privkey: S1 持有的 Paillier 私钥
-    :return: 布尔值 True if a < b else False
-    """
-    a = privkey.decrypt(enc_a)
-    b = privkey.decrypt(enc_b)
-    return a < b
-
-
-# --------------------------------------------------
-# 🔑 生成 Paillier 密钥对
-# --------------------------------------------------
-def generate_keypair():
-    """
-    生成 Paillier 公钥与私钥
-    :return: (public_key, private_key)
-    """
-    public_key, private_key = paillier.generate_paillier_keypair()
-    return public_key, private_key
-
-# --------------------------------------------------
-# 🔐 批量加密
-# --------------------------------------------------
-def encrypt_list(public_key, values):
-    """
-    使用公钥批量加密一组数值
-    :param public_key: Paillier 公钥
-    :param values: List[float/int] 明文列表
-    :return: List[EncryptedNumber]
-    """
-    return [public_key.encrypt(x) for x in values]
-
-# --------------------------------------------------
-# 🔓 批量解密
-# --------------------------------------------------
-def decrypt_list(private_key, encrypted_values):
-    """
-    使用私钥批量解密一组加密数值
-    :param private_key: Paillier 私钥
-    :param encrypted_values: List[EncryptedNumber]
-    :return: List[float]
-    """
-    return [private_key.decrypt(x) for x in encrypted_values]
-
-
-
 # ----------------------------------------------------
 # 📌 Crowding Distance
 # 输入：obj_values：二维目标值列表，front为个体索引列表
@@ -100,44 +47,6 @@ def compute_weighted_crowding_distance(obj_values, dec_values, front, alpha=0.5)
         distances[idx] = alpha * dist_obj[i] + (1 - alpha) * dist_dec[i]
 
     return distances
-
-#密文下计算个体在某一非支配层内的拥塞距离（Crowding Distance）
-def calculate_crowding_distance_enc(front, obj_list, pubkey, share0, share1, mu, n, n_sq):
-    """
-    front: 当前非支配层的索引列表（如 [1,3,6,...]）
-    obj_list: 所有个体的加密目标列表 [[Enc(f1), Enc(f2)], ...]
-    返回：crowding_distances（dict），索引为个体编号，值为密文加密的距离
-    """
-    num_obj = len(obj_list[0])
-    distance = {i: pubkey.encrypt(0) for i in front}  # 初始化所有为 Enc(0)
-
-    for m in range(num_obj):
-        # 对 front 中个体按第 m 个目标进行排序（用 secure_compare）
-        def cmp_key(i1, i2):
-            enc_a = obj_list[i1][m]
-            enc_b = obj_list[i2][m]
-            comp = secure_compare(enc_a, enc_b, pubkey, share0, share1, mu, n, n_sq)
-            return combine_shares(*partial_decrypt(comp, share0, pubkey, n_sq), mu, n)
-
-        sorted_front = sorted(front, key=lambda i: cmp_key(i, i))
-
-        f_min = obj_list[sorted_front[0]][m]
-        f_max = obj_list[sorted_front[-1]][m]
-
-        for i in range(1, len(sorted_front) - 1):
-            prev = obj_list[sorted_front[i - 1]][m]
-            next_ = obj_list[sorted_front[i + 1]][m]
-
-            # 计算邻域差值 diff = (next - prev) / (f_max - f_min)
-            enc_diff = next_ - prev
-
-            # 简化版本：不除以 (f_max - f_min)，避免除法（可改为保留 numerator）
-            distance[sorted_front[i]] += enc_diff  # 等价于“密文加权”距离
-
-    return distance
-
-
-
 
 
 # ---------------------------
@@ -460,7 +369,9 @@ def evaluate_quality_stable(x, enc_quals, pubkey):
     return total_qual if total_qual else pubkey.encrypt(0)
 
 
-def evaluate_individual_parallel(x, enc_costs, enc_quals, enc_weights, pubkey, share0, share1, mu, n, n_sq, min_assign, fast_mode=False):
+def evaluate_individual_parallel(x, enc_costs, enc_quals, enc_weights,
+                                 pubkey, share0, share1, mu, n, n_sq,
+                                 min_assign, fast_mode=False):
     T = len(x)
     N = len(x[0])
     valid = True
@@ -486,31 +397,50 @@ def evaluate_individual_parallel(x, enc_costs, enc_quals, enc_weights, pubkey, s
         enc_cost = evaluate_cost_stable_smulg(x, enc_costs, enc_weights, pubkey, share0, share1, mu, n, n_sq)
         enc_qual = evaluate_quality_stable(x, enc_quals, pubkey)
 
-    return (x, enc_cost, enc_qual)
+    # ✅ 返回带 key 的标识
+    return {
+        "x": x,
+        "enc_cost": enc_cost,
+        "enc_qual": enc_qual,
+        "key": str(x)  # 可换为 hash(tuple(x)) 更紧凑
+    }
+
 
 def parallel_evaluate_population(population, enc_costs, enc_quals, enc_weights,
                                  pubkey, share0, share1, mu, n, n_sq,
-                                 min_assign, fast_mode=False):
-    # ✅ 直接串行遍历
-    results = []
-    for x in tqdm(population, desc="🔁 串行评估中"):
-        result = evaluate_individual_parallel(
-            x=x,
-            enc_costs=enc_costs,
-            enc_quals=enc_quals,
-            enc_weights=enc_weights,
-            pubkey=pubkey,
-            share0=share0,
-            share1=share1,
-            mu=mu,
-            n=n,
-            n_sq=n_sq,
-            min_assign=min_assign,
-            fast_mode=fast_mode
-        )
-        results.append(result)
-    return results
+                                 min_assign, fast_mode=False,
+                                 use_cache=True):
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from tqdm import tqdm
+    import multiprocessing
 
+    # ✅ 初始化缓存
+    global decrypt_cache
+    if 'decrypt_cache' not in globals():
+        decrypt_cache = {}
+
+    results = []
+    with ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
+        futures = []
+        for x in population:
+            key = str(x)
+            if use_cache and key in decrypt_cache:
+                results.append(decrypt_cache[key])
+            else:
+                futures.append(executor.submit(
+                    evaluate_individual_parallel, x,
+                    enc_costs, enc_quals, enc_weights,
+                    pubkey, share0, share1, mu, n, n_sq,
+                    min_assign, fast_mode
+                ))
+
+        for f in tqdm(as_completed(futures), total=len(futures), desc="⚡并行评估中"):
+            result = f.result()
+            results.append((result["x"], result["enc_cost"], result["enc_qual"]))
+            if use_cache:
+                decrypt_cache[result["key"]] = (result["x"], result["enc_cost"], result["enc_qual"])
+
+    return results
 
 
 
@@ -691,36 +621,6 @@ def prepare_data(num_tasks, num_workers):
     )
 
 
-def save_all_solutions(obj_list, share0, share1, pubkey, mu, n, n_sq, output_file="all_solutions.txt"):
-    """
-    保存所有解的分配情况及其解密后的成本和质量。
-    """
-    lines = []
-    for idx, (x, enc_cost, enc_qual) in enumerate(obj_list):
-        # 解密
-        dec_cost = combine_shares(
-            partial_decrypt(enc_cost, share0, pubkey, n_sq),
-            partial_decrypt(enc_cost, share1, pubkey, n_sq),
-            mu, n
-        )
-        dec_qual = combine_shares(
-            partial_decrypt(enc_qual, share0, pubkey, n_sq),
-            partial_decrypt(enc_qual, share1, pubkey, n_sq),
-            mu, n
-        )
-        lines.append(f"🧬 个体 {idx+1}:\n")
-        for t, row in enumerate(x):
-            lines.append(f"  任务{t+1}: {row}\n")
-        lines.append(f"  📉 解密成本: {dec_cost}\n")
-        lines.append(f"  📈 解密质量: {dec_qual}\n")
-        lines.append("-" * 40 + "\n")
-
-    with open(output_file, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-
-    print(f"\n📁 所有个体解及解密目标已保存至：{output_file}")
-
-
 # ✅ 增强版：MOEO-WCD 引导浓度机制模块
 # 💡 本文件应与你已有的 run_moeo_wcd 函数一起使用，替代其中变异生成子代部分
 def generate_ceq_pool(parent, population, obj_list, strategy="mixed",
@@ -887,15 +787,9 @@ def isqrt(n):
 #后加的密文下乘法（SMUL）
 def secure_multiply(enc_x, enc_y, pubkey, share0, share1, mu, n, n_sq):
     """
-    离线缓存版本：使用预生成的扰动项进行密文乘法（SMUL）
+    多进程安全版本，使用本地加载缓存，不依赖 offline_ptr
     """
-    """
-    # 从缓存中取扰动
-    cache = offline_cache.pop() if offline_cache else None
-    if not cache:
-        raise RuntimeError("❌ 离线缓存耗尽，请先调用 generate_offline_cache() 生成")
-    """
-    cache = get_next_cache(pubkey=pubkey)  # ✅ 传入 pubkey
+    cache = get_next_cache_process_safe(pubkey=pubkey)
 
     r1 = cache['r1']
     r2 = cache['r2']
@@ -903,49 +797,36 @@ def secure_multiply(enc_x, enc_y, pubkey, share0, share1, mu, n, n_sq):
     enc_r2 = cache['enc_r2']
     enc_r1r2 = cache['enc_r1r2']
 
-    # 构造掩码
     enc_x_r2 = enc_x * r2 * -1
     enc_y_r1 = enc_y * r1 * -1
 
-    # 构造混合项
     enc_x_ = enc_x + enc_r1
     enc_y_ = enc_y + enc_r2
 
-    # 解密 enc_y_ 获取 y + r2
     u0 = partial_decrypt(enc_y_, share0, pubkey, n_sq)
     u1 = partial_decrypt(enc_y_, share1, pubkey, n_sq)
     y_plus_r2 = combine_shares(u0, u1, mu, n)
 
-    # 执行乘法 & 消除噪声
     enc_xy_noisy = enc_x_ * y_plus_r2
     result = enc_xy_noisy + enc_x_r2 + enc_y_r1 + (enc_r1r2 * -1)
     return result
+
 
 #后加的密文比较协议SCMP
 
 def secure_compare(enc_x, enc_y, pubkey, share0, share1, mu, n, n_sq):
     """
-    离线缓存版本：使用预生成的扰动元组完成密文比较
+    多进程安全版本，使用本地加载缓存
     """
-    """
-    # 从全局缓存中取出一组扰动
-    cache = offline_cache.pop() if offline_cache else None
-    if not cache:
-        raise RuntimeError("❌ 离线缓存耗尽，请先调用 generate_offline_cache() 生成")
-    """
-    cache = get_next_cache(pubkey=pubkey)  # ✅ 传入 pubkey
+    cache = get_next_cache_process_safe(pubkey=pubkey)
 
     r = cache['r1']
     r_dash = random.randint(n // 5, n // 4)
 
-    # 差值加密：enc(y - x + 1)
     enc_diff_base = enc_y - enc_x + pubkey.encrypt(1)
-
-    # 扰动：enc(r*(y - x + 1)) + r'
     enc_r_diff = enc_diff_base * r
     enc_full = enc_r_diff + pubkey.encrypt(r_dash)
 
-    # 解密 & 判断
     u0 = partial_decrypt(enc_full, share0, pubkey, n_sq)
     u1 = partial_decrypt(enc_full, share1, pubkey, n_sq)
     d = combine_shares(u0, u1, mu, n)
@@ -1001,26 +882,21 @@ def load_offline_cache():
 
 
 
-def get_next_cache(pubkey=None, refill_num=100):
+def get_next_cache_process_safe(pubkey=None, refill_num=100):
     """
-    获取一组扰动缓存，若耗尽则自动生成新缓存
-    :param pubkey: Paillier 公钥（用于补充时加密）
-    :param refill_num: 每次补充生成多少组
+    多进程安全版本的 get_next_cache（子进程中使用，不依赖全局变量）
+    每次调用从 offline_cache.pkl 中加载一组
     """
-    global offline_cache, offline_ptr
-
-    # 自动补充机制
-    if offline_ptr >= len(offline_cache):
+    if not os.path.exists("offline_cache.pkl"):
         if pubkey is None:
-            raise ValueError("❌ 缓存已耗尽，且未提供公钥用于补充！")
-        print(f"⚠️ 缓存耗尽，自动补充 {refill_num} 组...")
+            raise ValueError("❌ 无 offline_cache.pkl 且未提供 pubkey")
         generate_offline_cache(pubkey, num_sets=refill_num)
-        offline_cache = load_offline_cache()
-        offline_ptr = 0
 
-    cache = offline_cache[offline_ptr]
-    offline_ptr += 1
-    return cache
+    with open("offline_cache.pkl", "rb") as f:
+        cache_list = pickle.load(f)
+
+    # 每次随机返回一组（可选优化：循环指针或共享内存）
+    return random.choice(cache_list)
 
 
 # -----------------------------

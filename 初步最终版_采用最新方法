@@ -741,6 +741,11 @@ def run_moeo_wcd(pubkey, enc_costs, enc_quals, enc_weights,
         print("✅ 默认生成初始种群")
 
     print("✅ 初始种群构造完成，共", len(population), "个体")
+    # ✅ 打印每个个体
+    for idx, individual in enumerate(population):
+        print(f"\n🌱 个体 {idx + 1}:")
+        for t_idx, task_row in enumerate(individual):
+            print(f"  任务 {t_idx + 1}: {task_row}")
 
     for gen in tqdm(range(num_iter), desc="🌱 进化轮"):
         print(f"\n🌿 第 {gen + 1}/{num_iter} 轮开始")
@@ -1020,10 +1025,10 @@ def main():
 
     # ✅ 参数设置
     num_tasks = 3
-    num_workers = 8
-    min_assign = 1
+    num_workers = 10
+    min_assign = 2
     num_iter = 3
-    pop_size = 5
+    pop_size = 8
 
     # ✅ 上传加密数据（含位置与最大距离）
     simulate_worker_upload(num_tasks=num_tasks, num_workers=num_workers)

@@ -534,7 +534,7 @@ def simulate_worker_upload(num_tasks=3, num_workers=6):
     # ➕ 任务/工人位置与可接受距离
     raw_task_locs = [(random.randint(0, 50), random.randint(0, 50)) for _ in range(num_tasks)]
     raw_worker_locs = [(random.randint(0, 50), random.randint(0, 50)) for _ in range(num_workers)]
-    raw_max_dists = [random.randint(20, 50) for _ in range(num_workers)]
+    raw_max_dists = [random.randint(20, 40) for _ in range(num_workers)]
 
     # 加密
     enc_costs = [[encrypt(pubkey, raw_costs[t][i]) for i in range(num_workers)] for t in range(num_tasks)]
@@ -848,16 +848,11 @@ def isqrt(n):
 
 #后加的密文下乘法（SMUL）
 def secure_multiply(enc_x, enc_y, pubkey, share0, share1, mu, n, n_sq):
-    """
-    多进程安全版本，使用本地加载缓存，不依赖 offline_ptr
-    """
-    cache = get_next_cache_process_safe(pubkey=pubkey)
-
-    r1 = cache['r1']
-    r2 = cache['r2']
-    enc_r1 = cache['enc_r1']
-    enc_r2 = cache['enc_r2']
-    enc_r1r2 = cache['enc_r1r2']
+    r1 = random.randint(1, 10000)
+    r2 = random.randint(1, 10000)
+    enc_r1 = pubkey.encrypt(r1)
+    enc_r2 = pubkey.encrypt(r2)
+    enc_r1r2 = pubkey.encrypt(r1 * r2)
 
     enc_x_r2 = enc_x * r2 * -1
     enc_y_r1 = enc_y * r1 * -1
@@ -874,15 +869,11 @@ def secure_multiply(enc_x, enc_y, pubkey, share0, share1, mu, n, n_sq):
     return result
 
 
+
 #后加的密文比较协议SCMP
 
 def secure_compare(enc_x, enc_y, pubkey, share0, share1, mu, n, n_sq):
-    """
-    多进程安全版本，使用本地加载缓存
-    """
-    cache = get_next_cache_process_safe(pubkey=pubkey)
-
-    r = cache['r1']
+    r = random.randint(1, 10000)
     r_dash = random.randint(n // 5, n // 4)
 
     enc_diff_base = enc_y - enc_x + pubkey.encrypt(1)
@@ -893,7 +884,8 @@ def secure_compare(enc_x, enc_y, pubkey, share0, share1, mu, n, n_sq):
     u1 = partial_decrypt(enc_full, share1, pubkey, n_sq)
     d = combine_shares(u0, u1, mu, n)
 
-    return cache['enc_1'] if d > r_dash else cache['enc_0']
+    return pubkey.encrypt(1) if d > r_dash else pubkey.encrypt(0)
+
 
 #计算密文下曼哈顿距离（模拟绝对值）
 def secure_manhattan_distance(task_loc_enc, worker_loc_enc, pubkey, share0, share1, mu, n, n_sq):
@@ -1034,10 +1026,6 @@ def main():
     # ✅ 上传加密数据（含位置与最大距离）
     simulate_worker_upload(num_tasks=num_tasks, num_workers=num_workers)
 
-    with open('enc_worker_data.pkl', 'rb') as f:
-        data = pickle.load(f)
-    with open('threshold_key_shares.pkl', 'rb') as f:
-        key_parts = pickle.load(f)
 
     (pubkey, enc_costs, enc_quals, enc_weights,
      enc_task_locs, enc_worker_locs, enc_max_dists,
@@ -1066,10 +1054,6 @@ def main():
     for t, (x, y) in enumerate(raw_task_locs):
         print(f"任务 {t + 1}: ({x}, {y})")
 
-    # ✅ 离线缓存准备
-    if not os.path.exists("offline_cache.pkl"):
-        generate_offline_cache(pubkey, num_sets=300, num_workers=16)
-    print(f"✅ 已加载离线缓存")
 
     # ✅ 生成 reach[t][i] 矩阵
     print("\n🧮 正在计算可达性矩阵 reach[t][i]...")
@@ -1087,7 +1071,6 @@ def main():
 
     # ✅ 启动优化
     start_time = time.time()
-    # 替换为
     best_x, enc_best_cost, enc_best_qual, obj_list = run_nsga2(
         pubkey=pubkey,
         enc_costs=enc_costs,

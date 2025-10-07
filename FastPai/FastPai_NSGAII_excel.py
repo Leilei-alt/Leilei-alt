@@ -1,4 +1,4 @@
-
+from phe import paillier
 import random
 import numpy as np
 import pickle
@@ -10,6 +10,350 @@ from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
+# NSGA-II核心实现（加密环境下）
+def nsga2_non_dominated_sort_enc(obj_list, pubkey, share0, share1, mu, n, n_sq):
+    """
+    NSGA-II的非支配排序（支持加密目标值）
+    返回：fronts（List[List[int]]）多层非支配解索引
+    """
+    S = {}  # 支配集合
+    n_dom = {}  # 被支配次数
+    fronts = [[]]  # 非支配层
+
+    for p in range(len(obj_list)):
+        S[p] = []
+        n_dom[p] = 0
+        for q in range(len(obj_list)):
+            if p == q:
+                continue
+            if dominates_enc(obj_list[p], obj_list[q], pubkey, share0, share1, mu, n, n_sq):
+                S[p].append(q)
+            elif dominates_enc(obj_list[q], obj_list[p], pubkey, share0, share1, mu, n, n_sq):
+                n_dom[p] += 1
+        if n_dom[p] == 0:
+            fronts[0].append(p)
+
+    i = 0
+    while len(fronts[i]) > 0:
+        next_front = []
+        for p in fronts[i]:
+            for q in S[p]:
+                n_dom[q] -= 1
+                if n_dom[q] == 0:
+                    next_front.append(q)
+        i += 1
+        fronts.append(next_front)
+
+    # 去掉最后一个空层
+    if len(fronts[-1]) == 0:
+        fronts.pop()
+
+    return fronts
+
+
+def secure_sort_encrypted_numbers(enc_numbers, pubkey, share0, share1, mu, n, n_sq):
+    """
+    安全排序加密数列表；返回排序后的索引（升序）
+    注意：避免覆盖模数 n
+    """
+    cnt = len(enc_numbers)                 # 原来这里误写成了 n = len(enc_numbers)
+    indices = list(range(cnt))
+
+    for i in range(cnt):
+        for j in range(0, cnt - i - 1):
+            # 比较 enc_numbers[indices[j]] > enc_numbers[indices[j+1]]
+            if secure_greater_than(enc_numbers[indices[j]], enc_numbers[indices[j + 1]],
+                                   pubkey, share0, share1, mu, n, n_sq):
+                indices[j], indices[j + 1] = indices[j + 1], indices[j]
+    return indices
+
+
+def secure_greater_than(enc_a, enc_b, pubkey, share0, share1, mu, n, n_sq):
+    """
+    判断 enc_a > enc_b ?
+    利用 secure_compare(x, y) ≈ [x < y] 的加密位：
+      a > b  等价于  b < a
+    """
+    enc_bit = secure_compare(enc_b, enc_a, pubkey, share0, share1, mu, n, n_sq)  # [b < a]
+    u0 = partial_decrypt(enc_bit, share0, pubkey, n_sq)
+    u1 = partial_decrypt(enc_bit, share1, pubkey, n_sq)
+    bit = combine_shares(u0, u1, mu, n)
+    return bit == 1
+
+
+# 修改拥挤距离计算函数
+def nsga2_crowding_distance_assignment(obj_list, indices, pubkey, share0, share1, mu, n, n_sq):
+    """
+    NSGA-II的拥挤距离计算（支持加密目标值）
+    返回：{个体索引: 拥挤距离}
+    """
+    n_obj = 2  # 成本和质量两个目标
+    distances = {i: 0.0 for i in indices}
+
+    for m in range(n_obj):
+        # 提取当前目标的加密值
+        enc_values = [obj_list[i][1 + m] for i in indices]
+
+        # 使用安全排序获取索引
+        sorted_indices = secure_sort_encrypted_numbers(enc_values, pubkey, share0, share1, mu, n, n_sq)
+        # 映射回原始索引
+        sorted_indices = [indices[i] for i in sorted_indices]
+
+        # 边界点的拥挤距离设为无穷大
+        distances[sorted_indices[0]] = float('inf')
+        distances[sorted_indices[-1]] = float('inf')
+
+        # 计算目标值范围（需要解密）
+        min_val = combine_shares(
+            partial_decrypt(obj_list[sorted_indices[0]][1 + m], share0, pubkey, n_sq),
+            partial_decrypt(obj_list[sorted_indices[0]][1 + m], share1, pubkey, n_sq),
+            mu, n
+        )
+        max_val = combine_shares(
+            partial_decrypt(obj_list[sorted_indices[-1]][1 + m], share0, pubkey, n_sq),
+            partial_decrypt(obj_list[sorted_indices[-1]][1 + m], share1, pubkey, n_sq),
+            mu, n
+        )
+
+        if max_val - min_val == 0:  # 避免除零错误
+            continue
+
+        # 计算中间点的拥挤距离
+        for i in range(1, len(sorted_indices) - 1):
+            # 解密相邻点的目标值差
+            current = combine_shares(
+                partial_decrypt(obj_list[sorted_indices[i + 1]][1 + m], share0, pubkey, n_sq),
+                partial_decrypt(obj_list[sorted_indices[i + 1]][1 + m], share1, pubkey, n_sq),
+                mu, n
+            )
+            prev = combine_shares(
+                partial_decrypt(obj_list[sorted_indices[i - 1]][1 + m], share0, pubkey, n_sq),
+                partial_decrypt(obj_list[sorted_indices[i - 1]][1 + m], share1, pubkey, n_sq),
+                mu, n
+            )
+            distances[sorted_indices[i]] += (current - prev) / (max_val - min_val)
+
+    return distances
+
+def binary_tournament_selection(population, obj_list, fronts, crowding_dict, pubkey, share0, share1, mu, n, n_sq):
+    """
+    NSGA-II的二元锦标赛选择（基于非支配层级和拥挤距离）
+    """
+    idx1, idx2 = random.sample(range(len(population)), 2)
+
+    # 比较非支配层级
+    front1 = next(i for i, front in enumerate(fronts) if idx1 in front)
+    front2 = next(i for i, front in enumerate(fronts) if idx2 in front)
+
+    if front1 < front2:
+        return idx1
+    elif front1 > front2:
+        return idx2
+    else:
+        # 层级相同，比较拥挤距离
+        if crowding_dict[idx1] > crowding_dict[idx2]:
+            return idx1
+        else:
+            return idx2
+
+
+def crossover_and_mutation(parent1, parent2, reach, min_assign):
+    """
+    针对任务分配矩阵的交叉和变异操作
+    """
+    T = len(parent1)  # 任务数
+    N = len(parent1[0])  # 工人数
+
+    # 单点交叉
+    crossover_point = random.randint(1, T - 1)
+    child = parent1[:crossover_point] + parent2[crossover_point:]
+
+    # 变异：随机选择一个任务，重新分配工人
+    if random.random() < 0.2:  # 变异率20%
+        t = random.randint(0, T - 1)
+
+        # 清空当前任务的分配
+        child[t] = [0] * N
+
+        # 重新分配：至少分配min_assign个可达工人
+        candidates = [i for i in range(N) if reach[t][i] == 1]
+        if len(candidates) >= min_assign:
+            assigned = random.sample(candidates, min_assign)
+            for i in assigned:
+                child[t][i] = 1
+
+    return child
+
+
+def run_nsga2(pubkey, enc_costs, enc_quals, enc_weights,
+              share0, share1, mu, n, n_sq, reach,
+              num_iter=30, pop_size=20,
+              num_tasks=3, min_assign=1,
+              fast_mode=False, init_population=None,max_budgets=None):
+    """
+    NSGA-II主函数（加密环境下）
+    """
+    N = len(enc_costs[0])  # 工人数
+    T = num_tasks
+
+    print("✅ 正在初始化初始种群...")
+
+    if init_population is not None:
+        population = init_population
+        print("✅ 使用外部传入的初始种群")
+    else:
+        population = [generate_random_matrix_with_reach(T, N, min_assign, reach)
+                      for _ in range(pop_size)]
+        print("✅ 默认生成初始种群")
+
+    for gen in tqdm(range(num_iter), desc="🌱 进化轮"):
+        print(f"\n🌿 第 {gen + 1}/{num_iter} 轮开始")
+
+        # 评估种群目标
+        print("⚡ 开始评估当前种群个体目标值...")
+        obj_list = parallel_evaluate_population(
+            population=population,
+            enc_costs=enc_costs,
+            enc_quals=enc_quals,
+            enc_weights=enc_weights,
+            pubkey=pubkey,
+            share0=share0,
+            share1=share1,
+            mu=mu,
+            n=n,
+            n_sq=n_sq,
+            min_assign=min_assign,
+            fast_mode=fast_mode,
+            max_budgets=max_budgets  # 传递最大预算
+        )
+        print("✅ 个体评估完成")
+
+        print("✅ 正在进行非支配排序...")
+        fronts = nsga2_non_dominated_sort_enc(obj_list, pubkey, share0, share1, mu, n, n_sq)
+        print("✅ 非支配排序完成，前层个体数量:", len(fronts[0]))
+
+        print("📏 计算拥挤距离...")
+        # 为每个前沿计算拥挤距离
+        crowding_dict = {}
+        for front in fronts:
+            front_crowding = nsga2_crowding_distance_assignment(obj_list, front, pubkey, share0, share1, mu, n, n_sq)
+            crowding_dict.update(front_crowding)
+        print("✅ 拥挤距离计算完成")
+
+        # 创建子代
+        print("🧬 正在生成下一代个体...")
+        offspring = []
+        while len(offspring) < pop_size:
+            # 选择父代
+            parent1_idx = binary_tournament_selection(population, obj_list, fronts, crowding_dict, pubkey, share0,
+                                                      share1, mu, n, n_sq)
+            parent2_idx = binary_tournament_selection(population, obj_list, fronts, crowding_dict, pubkey, share0,
+                                                      share1, mu, n, n_sq)
+
+            # 交叉和变异
+            child = crossover_and_mutation(
+                population[parent1_idx],
+                population[parent2_idx],
+                reach,
+                min_assign
+            )
+
+            offspring.append(child)
+
+        # 合并父代和子代，选择下一代
+        combined_pop = population + offspring
+        combined_obj = obj_list + parallel_evaluate_population(
+            population=offspring,
+            enc_costs=enc_costs,
+            enc_quals=enc_quals,
+            enc_weights=enc_weights,
+            pubkey=pubkey,
+            share0=share0,
+            share1=share1,
+            mu=mu,
+            n=n,
+            n_sq=n_sq,
+            min_assign=min_assign,
+            fast_mode=fast_mode
+        )
+
+        # 基于非支配排序和拥挤距离选择新种群
+        new_population = []
+        fronts = nsga2_non_dominated_sort_enc(combined_obj, pubkey, share0, share1, mu, n, n_sq)
+
+        for front in fronts:
+            if len(new_population) + len(front) <= pop_size:
+                # 整个前沿都被选中
+                new_population.extend([combined_pop[i] for i in front])
+            else:
+                # 前沿无法全部选中，按拥挤距离排序选择
+                front_crowding = nsga2_crowding_distance_assignment(combined_obj, front, pubkey, share0, share1, mu, n,
+                                                                    n_sq)
+                sorted_indices = sorted(front, key=lambda i: front_crowding[i], reverse=True)
+                remaining = pop_size - len(new_population)
+                new_population.extend([combined_pop[i] for i in sorted_indices[:remaining]])
+                break
+
+        population = new_population
+        print(f"✅ 第 {gen + 1} 轮迭代完成，已生成新种群 ✅")
+
+    # 选择最优解（前沿0中拥挤距离最大的解）
+    fronts = nsga2_non_dominated_sort_enc(obj_list, pubkey, share0, share1, mu, n, n_sq)
+    front0 = fronts[0]
+    crowding_dict = nsga2_crowding_distance_assignment(obj_list, front0, pubkey, share0, share1, mu, n, n_sq)
+
+    best_idx = max(front0, key=lambda i: crowding_dict[i])
+    best_x, best_cost, best_qual = obj_list[best_idx]
+
+    print("\n🏆 优化完成，最优任务分配方案如下：")
+    for t in range(T):
+        print(f"  任务{t + 1}: {best_x[t]}")
+
+    return best_x, best_cost, best_qual, obj_list
+
+# ----------------------------------------------------
+# 📌 Crowding Distance
+# 输入：obj_values：二维目标值列表，front为个体索引列表
+# 输出：返回对应个体的 WCD 距离（np.array，未在front中的为0）
+# 参数 alpha 控制权重（目标空间 vs 决策空间）
+# ----------------------------------------------------
+def compute_weighted_crowding_distance(obj_values, dec_values, front, alpha=0.5):
+    n_obj = len(obj_values[0])
+    distances = np.zeros(len(obj_values))
+
+    front_obj = [obj_values[i] for i in front]
+    front_dec = [dec_values[i] for i in front]
+
+    obj_array = np.array(front_obj)
+    dec_array = np.array(front_dec)
+
+    norm_obj = (obj_array - obj_array.min(axis=0)) / (np.ptp(obj_array, axis=0) + 1e-9)
+    norm_dec = (dec_array - dec_array.min(axis=0)) / (np.ptp(dec_array, axis=0) + 1e-9)
+
+    dist_obj = np.zeros(len(front))
+    dist_dec = np.zeros(len(front))
+
+    for m in range(n_obj):
+        idx = np.argsort(norm_obj[:, m])
+        dist_obj[idx[0]] = dist_obj[idx[-1]] = float('inf')
+        for i in range(1, len(front) - 1):
+            dist_obj[idx[i]] += norm_obj[idx[i + 1], m] - norm_obj[idx[i - 1], m]
+
+    for m in range(dec_array.shape[1]):
+        idx = np.argsort(norm_dec[:, m])
+        dist_dec[idx[0]] = dist_dec[idx[-1]] = float('inf')
+        for i in range(1, len(front) - 1):
+            dist_dec[idx[i]] += norm_dec[idx[i + 1], m] - norm_dec[idx[i - 1], m]
+
+    for i, idx in enumerate(front):
+        distances[idx] = alpha * dist_obj[i] + (1 - alpha) * dist_dec[i]
+
+    return distances
+
+
+# ---------------------------
+# 阈值密钥生成（share0 + share1 = λ）
+# ---------------------------
 # ===== FastPai 适配层（替代 phe）========================================
 import math, random, secrets
 from dataclasses import dataclass
@@ -145,14 +489,9 @@ def fastpai_generate_threshold_keypair(kappa=112):
 # 新：直接把 FastPai 的生成器映射为旧名字，调用方不需要改
 generate_threshold_keypair = fastpai_generate_threshold_keypair
 
-# ---------------------------
-# 阈值密钥生成（share0 + share1 = λ）
-# ---------------------------
+
 def lcm(a, b):
     return abs(a * b) // math.gcd(a, b)
-
-
-
 
 
 # ---------------------------
@@ -235,15 +574,13 @@ def generate_random_matrix_with_reach(num_tasks, num_workers, min_assign, reach)
 # 输入：二维列表 obj_values，每个元素是一个个体的 [目标1, 目标2]
 # 输出：Pareto 层级列表 fronts，每一层包含个体索引
 # ----------------------------------------------------
-def _canon_small(m, n):
-    """把模 n 的结果映射到对称区间 (-n//2, n//2]，避免出现“接近 n 的大数”表示同一个小负数。"""
-    return m - n if m > n // 2 else m
+def is_duplicate(new_sol, pareto_set, pubkey, share0, share1, mu, n, n_sq, epsilon=1e-6):
+    """检查 new_sol 是否在 pareto_set 中已存在（去重），需解密目标值后比较。"""
+    # new_sol 结构：(x, enc_cost, enc_qual)，提取加密的目标值
+    enc_cost_new = new_sol[1]  # 加密的成本
+    enc_qual_new = new_sol[2]  # 加密的质量
 
-def is_duplicate(new_sol, pareto_set, pubkey, share0, share1, mu, n, n_sq):
-    """解密后用纯整数比较判断是否重复，避免 float 溢出。"""
-    enc_cost_new = new_sol[1]
-    enc_qual_new = new_sol[2]
-
+    # 解密新解的目标值
     dec_cost_new = combine_shares(
         partial_decrypt(enc_cost_new, share0, pubkey, n_sq),
         partial_decrypt(enc_cost_new, share1, pubkey, n_sq),
@@ -254,14 +591,15 @@ def is_duplicate(new_sol, pareto_set, pubkey, share0, share1, mu, n, n_sq):
         partial_decrypt(enc_qual_new, share1, pubkey, n_sq),
         mu, n
     )
+    new_sol_array = np.array([dec_cost_new, dec_qual_new], dtype=float)  # 确保是浮动类型
 
-    # 规范化，避免大整数等价表示
-    new_pair = (_canon_small(dec_cost_new, n), _canon_small(dec_qual_new, n))
-
+    # 遍历已有帕累托解，解密后比较
     for sol in pareto_set:
+        # sol 结构：(x, enc_cost, enc_qual)
         enc_cost_sol = sol[1]
         enc_qual_sol = sol[2]
 
+        # 解密已有解的目标值
         dec_cost_sol = combine_shares(
             partial_decrypt(enc_cost_sol, share0, pubkey, n_sq),
             partial_decrypt(enc_cost_sol, share1, pubkey, n_sq),
@@ -272,16 +610,13 @@ def is_duplicate(new_sol, pareto_set, pubkey, share0, share1, mu, n, n_sq):
             partial_decrypt(enc_qual_sol, share1, pubkey, n_sq),
             mu, n
         )
+        sol_array = np.array([dec_cost_sol, dec_qual_sol], dtype=float)  # 确保是浮动类型
 
-        sol_pair = (_canon_small(dec_cost_sol, n), _canon_small(dec_qual_sol, n))
-
-        # 直接用整数判等即可；如需“近似重复”，可改成判断 L1 距离是否为 0
-        if new_pair == sol_pair:
+        # 计算欧氏距离判断是否重复
+        distance = np.linalg.norm(new_sol_array - sol_array)  # 这里确保是浮动类型
+        if distance < epsilon:
             return True
-
     return False
-
-
 
 def fast_non_dominated_sort_enc(obj_list, pubkey, share0, share1, mu, n, n_sq):
     """
@@ -337,40 +672,6 @@ def fast_non_dominated_sort_enc(obj_list, pubkey, share0, share1, mu, n, n_sq):
 
     return unique_fronts
 
-def compute_weighted_crowding_distance(obj_values, dec_values, front, alpha=0.5):
-    n_obj = len(obj_values[0])
-    distances = np.zeros(len(obj_values))
-
-    front_obj = [obj_values[i] for i in front]
-    front_dec = [dec_values[i] for i in front]
-
-    obj_array = np.array(front_obj)
-    dec_array = np.array(front_dec)
-
-    norm_obj = (obj_array - obj_array.min(axis=0)) / (np.ptp(obj_array, axis=0) + 1e-9)
-    norm_dec = (dec_array - dec_array.min(axis=0)) / (np.ptp(dec_array, axis=0) + 1e-9)
-
-    dist_obj = np.zeros(len(front))
-    dist_dec = np.zeros(len(front))
-
-    for m in range(n_obj):
-        idx = np.argsort(norm_obj[:, m])
-        dist_obj[idx[0]] = dist_obj[idx[-1]] = float('inf')
-        for i in range(1, len(front) - 1):
-            dist_obj[idx[i]] += norm_obj[idx[i + 1], m] - norm_obj[idx[i - 1], m]
-
-    for m in range(dec_array.shape[1]):
-        idx = np.argsort(norm_dec[:, m])
-        dist_dec[idx[0]] = dist_dec[idx[-1]] = float('inf')
-        for i in range(1, len(front) - 1):
-            dist_dec[idx[i]] += norm_dec[idx[i + 1], m] - norm_dec[idx[i - 1], m]
-
-    for i, idx in enumerate(front):
-        distances[idx] = alpha * dist_obj[i] + (1 - alpha) * dist_dec[i]
-
-    return distances
-
-
 
 def compute_weighted_crowding_distance(obj_list, population, front_indices,
                                        pubkey, share0, share1, mu, n, n_sq,
@@ -379,7 +680,6 @@ def compute_weighted_crowding_distance(obj_list, population, front_indices,
     使用加权替代策略计算密文拥塞距离（无需排序）：
     EncCrowding = α × (enc_max_cost - enc_cost) + (1 - α) × enc_qual
     """
-
     enc_costs = [obj_list[i][1] for i in front_indices]
     enc_quals = [obj_list[i][2] for i in front_indices]
 
@@ -394,13 +694,10 @@ def compute_weighted_crowding_distance(obj_list, population, front_indices,
         enc_cost = obj_list[i][1]
         enc_qual = obj_list[i][2]
 
-        S = 10 ** 6  # 统一放缩系数
-        A = int(round(alpha * S))
-        B = int(round((1 - alpha) * S))
-
+        # ➗ crowding = α*(max_cost - cost) + (1-α)*qual
         enc_diff = enc_max_cost - enc_cost
-        enc_part1 = enc_diff * A  # 只做整数标量乘
-        enc_part2 = enc_qual * B
+        enc_part1 = enc_diff * alpha
+        enc_part2 = enc_qual * (1 - alpha)
         enc_crowding = enc_part1 + enc_part2
 
         crowding_dict[i] = enc_crowding
@@ -421,46 +718,31 @@ def integrate_elite_selection(population, crowding_dict, k, pubkey, share0, shar
     return elite_indices
 
 
-def select_best_by_custom_score(obj_list, share0, share1, pubkey, mu, n, n_sq, alpha=0.7, beta=0.3):
+def select_best_by_custom_score(obj_list, share0, share1, pubkey, mu, n, n_sq, alpha=0.7, beta=0.3, eps=1e-6):
     """
-    用分数交叉相乘比较 (alpha*qual)/(beta*cost+1)，全程整数，不会溢出。
-    eps 改成 +1，反正成本是正数，这只是避免除零。
+    基于自定义评分函数 Score = (alpha * quality) / (beta * cost) 选择最优个体
     """
-    A = int(round(alpha * 10**6))
-    B = int(round(beta  * 10**6))
-
-    def canon(m):  # 复用上面的对称映射思路
-        return m - n if m > n // 2 else m
-
     best_idx = None
-    best_num = None
-    best_den = None
+    best_score = float('-inf')
 
     for i, (_, enc_cost, enc_qual) in enumerate(obj_list):
-        dec_cost = canon(combine_shares(
+        dec_cost = combine_shares(
             partial_decrypt(enc_cost, share0, pubkey, n_sq),
             partial_decrypt(enc_cost, share1, pubkey, n_sq),
             mu, n
-        ))
-        dec_qual = canon(combine_shares(
+        )
+        dec_qual = combine_shares(
             partial_decrypt(enc_qual, share0, pubkey, n_sq),
             partial_decrypt(enc_qual, share1, pubkey, n_sq),
             mu, n
-        ))
+        )
 
-        # 分子/分母都用整数
-        num = dec_qual * A
-        den = dec_cost * B + 1  # 避免 0 分母
-
-        if best_idx is None:
-            best_idx, best_num, best_den = i, num, den
-        else:
-            # 比较 num/den 与 best_num/best_den
-            if num * best_den > best_num * den:
-                best_idx, best_num, best_den = i, num, den
+        score = (dec_qual * alpha) / (dec_cost * beta + eps)
+        if score > best_score:
+            best_score = score
+            best_idx = i
 
     return best_idx
-
 
 
 # -------------------------------
@@ -504,77 +786,68 @@ def evaluate_quality_stable(x, enc_quals, enc_weights,
                 total_qual = enc_qw if total_qual is None else (total_qual + enc_qw)
     return total_qual if total_qual else pubkey.encrypt(0)
 
-
-
 def evaluate_individual_parallel(x, enc_costs, enc_quals, enc_weights,
                                  pubkey, share0, share1, mu, n, n_sq,
-                                 min_assign, fast_mode=False, max_budgets=None):  # 增加 max_budgets 参数
+                                 min_assign, fast_mode=False, max_budgets=None):
+    """
+    新增 max_budgets: List[int] 或 None
+      - 若提供，则对每个任务 t，累计该任务下被分配工人的“明文成本”并与 max_budgets[t] 比较
+      - 超预算则该解判为无效（高成本、零质量）
+    其他约束：
+      - 每个任务至少 min_assign
+      - 每个工人最多参与 1 个任务
+    """
     T = len(x)
     N = len(x[0])
     valid = True
-    total_cost = 0  # 用于计算任务的总成本
 
-    # 检查每个任务是否有足够的工人，并且工人的总成本不超过预算
-    for t in range(T):
-        task_cost = 0  # 任务 t 的工人总成本
-        for i in range(N):
-            if x[t][i] == 1:  # 如果工人 i 被分配到任务 t
-                task_cost += enc_costs[t][i]  # 累加工人 i 的成本
-
-        # 解密任务的总成本
-        dec_task_cost = 0
-        for i in range(N):
-            if x[t][i] == 1:  # 只有工人被分配到任务时，才计算总成本
-                dec_task_cost += combine_shares(
-                    partial_decrypt(enc_costs[t][i], share0, pubkey, n_sq),
-                    partial_decrypt(enc_costs[t][i], share1, pubkey, n_sq),
-                    mu, n
-                )
-
-        # 打印每个任务的解密成本
-        print(f"任务 {t+1} 的解密成本: {dec_task_cost}")
-
-        # 检查该任务的总成本是否超过预算
-        if dec_task_cost > max_budgets[t]:  # 如果超过预算，标记为无效个体
-            valid = False
-            break
-        total_cost += dec_task_cost  # 累加所有任务的总成本
-
-    # 如果不满足任务的工人分配要求（每个任务至少分配 min_assign 个工人），标记为无效
+    # 任务最小分配
     for t in range(T):
         if sum(x[t]) < min_assign:
             valid = False
             break
 
+    # 工人唯一性
+    if valid:
+        for i in range(N):
+            if sum(x[t][i] for t in range(T)) > 1:
+                valid = False
+                break
+
+    # 任务预算（如提供）
+    if valid and max_budgets is not None:
+        for t in range(T):
+            dec_task_cost = 0
+            for i in range(N):
+                if x[t][i] == 1:
+                    dec_task_cost += combine_shares(
+                        partial_decrypt(enc_costs[t][i], share0, pubkey, n_sq),
+                        partial_decrypt(enc_costs[t][i], share1, pubkey, n_sq),
+                        mu, n
+                    )
+            if dec_task_cost > max_budgets[t]:
+                valid = False
+                break
+
     if fast_mode:
         cost = sum(i * x[t][i] for t in range(T) for i in range(N))
         qual = sum(10 * x[t][i] for t in range(T) for i in range(N))
-        return (x, pubkey.encrypt(cost), pubkey.encrypt(qual))
+        return {"x": x, "enc_cost": pubkey.encrypt(cost), "enc_qual": pubkey.encrypt(qual), "key": str(x)}
 
     if not valid:
-        enc_cost = pubkey.encrypt(999999)  # 给无效个体一个非常大的成本
+        enc_cost = pubkey.encrypt(999999)
         enc_qual = pubkey.encrypt(0)
     else:
         enc_cost = evaluate_cost_stable_smulg(x, enc_costs, enc_weights, pubkey, share0, share1, mu, n, n_sq)
-        # 现在（加权质量）：
-        enc_qual = evaluate_quality_stable(
-            x, enc_quals, enc_weights,
-            pubkey, share0, share1, mu, n, n_sq
-        )
+        enc_qual = evaluate_quality_stable(x, enc_quals, enc_weights, pubkey, share0, share1, mu, n, n_sq)
 
-    # ✅ 返回带 key 的标识
-    return {
-        "x": x,
-        "enc_cost": enc_cost,
-        "enc_qual": enc_qual,
-        "key": str(x)  # 可换为 hash(tuple(x)) 更紧凑
-    }
+    return {"x": x, "enc_cost": enc_cost, "enc_qual": enc_qual, "key": str(x)}
 
 
 def parallel_evaluate_population(population, enc_costs, enc_quals, enc_weights,
                                  pubkey, share0, share1, mu, n, n_sq,
                                  min_assign, fast_mode=False,
-                                 use_cache=True, max_budgets=None):  # 增加 max_budgets 参数
+                                 use_cache=True, max_budgets=None):
     from concurrent.futures import ProcessPoolExecutor, as_completed
     from tqdm import tqdm
     import multiprocessing
@@ -596,7 +869,7 @@ def parallel_evaluate_population(population, enc_costs, enc_quals, enc_weights,
                     evaluate_individual_parallel, x,
                     enc_costs, enc_quals, enc_weights,
                     pubkey, share0, share1, mu, n, n_sq,
-                    min_assign, fast_mode, max_budgets  # 传递 max_budgets
+                    min_assign, fast_mode, max_budgets
                 ))
 
         for f in tqdm(as_completed(futures), total=len(futures), desc="⚡并行评估中"):
@@ -606,7 +879,6 @@ def parallel_evaluate_population(population, enc_costs, enc_quals, enc_weights,
                 decrypt_cache[result["key"]] = (result["x"], result["enc_cost"], result["enc_qual"])
 
     return results
-
 
 
 
@@ -821,10 +1093,11 @@ def simulate_worker_upload(num_tasks=5, num_workers=15):
     print("✅ 多任务加密数据上传成功（使用固定数据）")
 
 
+
+
 # -----------------------------
 # 工人数据准备 + 平台密钥加载
 # -----------------------------
-
 def prepare_data(num_tasks, num_workers):
     # 模拟上传数据
     simulate_worker_upload(num_tasks=num_tasks, num_workers=num_workers)
@@ -930,7 +1203,7 @@ def run_moeo_wcd(pubkey, enc_costs, enc_quals, enc_weights,
                  share0, share1, mu, n, n_sq, reach,
                  num_iter=30, pop_size=20,
                  num_tasks=3, min_assign=2,
-                 fast_mode=False,init_population=None,max_budgets=None):
+                 fast_mode=False,init_population=None):
     """
     多任务-多目标优化主函数，支持并行评估 + 快速评估 + tqdm 进度。
     增加调试日志用于确认程序运行状态。
@@ -972,8 +1245,7 @@ def run_moeo_wcd(pubkey, enc_costs, enc_quals, enc_weights,
             n=n,
             n_sq=n_sq,
             min_assign=min_assign,
-            fast_mode=fast_mode,
-            max_budgets=max_budgets  # 传递最大预算
+            fast_mode=fast_mode
         )
         print("✅ 个体评估完成")
 
@@ -982,12 +1254,9 @@ def run_moeo_wcd(pubkey, enc_costs, enc_quals, enc_weights,
         print("✅ 非支配排序完成，前层个体数量:", len(fronts[0]))
 
         print("📏 计算加权拥塞距离...")
-
         crowding = compute_weighted_crowding_distance(obj_list, population, fronts[0],
                                                       pubkey, share0, share1, mu, n, n_sq,
                                                       alpha=0.5)
-
-
         print("✅ 拥塞距离计算完成")
 
         print("🎯 正在选择精英个体...")
@@ -999,29 +1268,21 @@ def run_moeo_wcd(pubkey, enc_costs, enc_quals, enc_weights,
         print("🧬 正在生成下一代个体...")
         unique_new_population = []
         retry_counter = 0
-        max_retry = pop_size * 5
-
-        # 🎯 把精英直接放进新种群，先占坑
-        unique_new_population = [population[i] for i in elite_indices]
-
-        parents_pool = elite_indices if elite_indices else list(range(len(population)))
+        max_retry = pop_size * 2
 
         while len(unique_new_population) < pop_size and retry_counter < max_retry:
-            parent_idx = random.choice(parents_pool)  # ✅ 只在精英里挑父母
+            parent_idx = random.randrange(len(population))
             parent = population[parent_idx]
 
-            ceq_pool = generate_ceq_pool(
-                parent,
-                population,  # 若不想改 generate_ceq_pool，可先维持全体作“邻居候选”
-                obj_list,
-                strategy="mixed",
-                pubkey=pubkey, share0=share0, share1=share1, mu=mu, n=n, n_sq=n_sq,
-                parent_idx=parent_idx  # ✅ 与 obj_list 对齐的原始索引
-            )
+            ceq_pool = generate_ceq_pool(parent, population, obj_list, strategy="mixed",
+                                         pubkey=pubkey, share0=share0, share1=share1,
+                                         mu=mu, n=n, n_sq=n_sq, parent_idx=parent_idx)
 
             child = update_with_ceq(parent, ceq_pool)
+
             if child not in unique_new_population:
                 unique_new_population.append(child)
+                print(f"🧪 子代 {len(unique_new_population)} / {pop_size} 生成完成")
             else:
                 retry_counter += 1
 
@@ -1319,18 +1580,14 @@ def append_run_result(xlsx_path: str, params: dict, best_cost: int, best_qual: i
     ])
     wb.save(xlsx_path)
 
-
 # -----------------------------
 # 主运行流程
 # -----------------------------
 def main():
-
-
-
     # ✅ 参数设置（从 Excel 读取多组；每行一组参数）
     import pandas as pd
 
-    excel_path = 'data.xlsx'  # 你的参数表；Sheet 名：Config
+    excel_path = 'data_nsga.xlsx'  # 你的参数表；Sheet 名：Config
     df_cfg = pd.read_excel(excel_path, sheet_name='Config')
 
     # 要求表头包含以下列名（不区分大小写也可自己统一转小写）：
@@ -1362,9 +1619,13 @@ def main():
 
             print("🔐 加密众包优化系统启动...")
 
-            # ===== 从这里开始，保持你原来的逻辑不变 =====
             # ✅ 上传加密数据（含位置与最大距离）
             simulate_worker_upload(num_tasks=num_tasks, num_workers=num_workers)
+
+            with open('enc_worker_data.pkl', 'rb') as f:
+                data = pickle.load(f)
+            with open('threshold_key_shares.pkl', 'rb') as f:
+                key_parts = pickle.load(f)
 
             (pubkey, enc_costs, enc_quals, enc_weights,
              enc_task_locs, enc_worker_locs, enc_max_dists,
@@ -1386,7 +1647,7 @@ def main():
 
             print("\n📌 任务质量矩阵:")
             for t in range(num_tasks):
-                print(f"任务 {t + 1}: {raw_quals[t]}")
+                print(f"任务 {t+1}: {raw_quals[t]}")
 
             # ✅ 打印明文位置信息
             print("\n📌 任务位置坐标:")
@@ -1404,7 +1665,7 @@ def main():
                                               pubkey, share0, share1, mu, n, n_sq)
             print("\n📌 可达性矩阵（1 = 可分配，0 = 超距）:")
             for t in range(num_tasks):
-                print(f"任务 {t + 1}: {reach[t]}")
+                print(f"任务 {t+1}: {reach[t]}")
 
             check_task_reachability(reach)
 
@@ -1414,7 +1675,8 @@ def main():
 
             # ✅ 启动优化
             start_time = time.time()
-            best_x, enc_best_cost, enc_best_qual, obj_list = run_moeo_wcd(
+            # 替换为
+            best_x, enc_best_cost, enc_best_qual, obj_list = run_nsga2(
                 pubkey=pubkey,
                 enc_costs=enc_costs,
                 enc_quals=enc_quals,
@@ -1430,8 +1692,8 @@ def main():
                 num_tasks=num_tasks,
                 min_assign=min_assign,
                 fast_mode=False,
-                init_population=population,  # ✅ 显式传入初始化种群
-                max_budgets=max_budgets  # 传递预算限制
+                init_population=population,
+                max_budgets=max_budgets  # 传递最大预算
             )
 
             print("当前 obj_list 内容：")
@@ -1464,6 +1726,7 @@ def main():
                 )
                 print(f"🧬 解 {i}: 成本 = {dec_cost}, 质量 = {dec_qual}")
 
+            # ✅ 解密输出结果
             print(f"\n✅ 最终任务分配方案：")
             for t, task_assign in enumerate(best_x):
                 print(f"任务 {t + 1}: {task_assign}")
@@ -1485,7 +1748,7 @@ def main():
             # ===== 你的原始逻辑到此结束；下一轮循环自动开始 =====
 
             # ===== 写入 Results 工作表 =====
-            excel_path = "data.xlsx"  # 自己的结果文件名/路径
+            excel_path = "data_nsga.xlsx"  # 自己的结果文件名/路径
             params_for_log = {
                 "num_tasks": num_tasks,
                 "num_workers": num_workers,

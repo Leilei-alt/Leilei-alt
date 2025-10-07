@@ -174,6 +174,12 @@ def combine_shares(u0, u1, mu, n, max_bits=4096):
     m = (L * mu) % n         # 恢复明文
     return int(m)
 
+
+def to_signed_mod(m: int, n: int) -> int:
+    """把模 n 的代表元映射回 (-n/2, n/2] 区间，避免出现接近 n 的大正数"""
+    return m - n if m > (n // 2) else m
+
+
 # -------------------------------
 # 随机解生成与变异（初始化考虑 reach 约束）
 # -------------------------------
@@ -209,13 +215,25 @@ def generate_random_matrix_with_reach(num_tasks, num_workers, min_assign, reach)
 # ----------------------------------------------------
 # 非支配排序 & 判重（保持不变）
 # ----------------------------------------------------
-def is_duplicate(new_sol, pareto_set, pubkey, share0, share1, mu, n, n_sq, epsilon=1e-6):
-    """检查 new_sol 是否在 pareto_set 中已存在（去重），需解密目标值后比较。"""
-    # new_sol 结构：(x, enc_cost, enc_qual)，提取加密的目标值
-    enc_cost_new = new_sol[1]  # 加密的成本
-    enc_qual_new = new_sol[2]  # 加密的质量
+def is_duplicate(new_sol, pareto_set, pubkey, share0, share1, mu, n, n_sq,
+                 epsilon_int: int = 0, epsilon: float = None):
+    """
+    判重（兼容旧参数名 epsilon）：
+      - 解密后先做有符号映射
+      - 用整数 L1 距离： |cost1-cost2| + |qual1-qual2| <= 阈值 则视为重复
+    参数：
+      - epsilon_int：整数阈值（默认 0，严格相等才重复）
+      - epsilon：旧代码传入的浮点阈值；如提供则自动转换为 int 并覆盖 epsilon_int
+    """
+    if epsilon is not None:
+        try:
+            epsilon_int = int(round(epsilon))
+        except Exception:
+            epsilon_int = 0
 
-    # 解密新解的目标值
+    # --- 新解 ---
+    enc_cost_new = new_sol[1]
+    enc_qual_new = new_sol[2]
     dec_cost_new = combine_shares(
         partial_decrypt(enc_cost_new, share0, pubkey, n_sq),
         partial_decrypt(enc_cost_new, share1, pubkey, n_sq),
@@ -226,15 +244,13 @@ def is_duplicate(new_sol, pareto_set, pubkey, share0, share1, mu, n, n_sq, epsil
         partial_decrypt(enc_qual_new, share1, pubkey, n_sq),
         mu, n
     )
-    new_sol_array = np.array([dec_cost_new, dec_qual_new], dtype=float)  # 确保是浮动类型
+    cost_new = to_signed_mod(dec_cost_new, n)
+    qual_new = to_signed_mod(dec_qual_new, n)
 
-    # 遍历已有帕累托解，解密后比较
+    # --- 与已有解比较 ---
     for sol in pareto_set:
-        # sol 结构：(x, enc_cost, enc_qual)
         enc_cost_sol = sol[1]
         enc_qual_sol = sol[2]
-
-        # 解密已有解的目标值
         dec_cost_sol = combine_shares(
             partial_decrypt(enc_cost_sol, share0, pubkey, n_sq),
             partial_decrypt(enc_cost_sol, share1, pubkey, n_sq),
@@ -245,11 +261,11 @@ def is_duplicate(new_sol, pareto_set, pubkey, share0, share1, mu, n, n_sq, epsil
             partial_decrypt(enc_qual_sol, share1, pubkey, n_sq),
             mu, n
         )
-        sol_array = np.array([dec_cost_sol, dec_qual_sol], dtype=float)  # 确保是浮动类型
+        cost_sol = to_signed_mod(dec_cost_sol, n)
+        qual_sol = to_signed_mod(dec_qual_sol, n)
 
-        # 计算欧氏距离判断是否重复
-        distance = np.linalg.norm(new_sol_array - sol_array)  # 这里确保是浮动类型
-        if distance < epsilon:
+        l1 = abs(cost_new - cost_sol) + abs(qual_new - qual_sol)
+        if l1 <= epsilon_int:
             return True
     return False
 
@@ -341,10 +357,33 @@ def integrate_elite_selection(population, crowding_dict, k, pubkey, share0, shar
         elite_indices += supplement
     return elite_indices
 
-def select_best_by_custom_score(obj_list, share0, share1, pubkey, mu, n, n_sq, alpha=0.7, beta=0.3, eps=1e-6):
+from fractions import Fraction
+
+def select_best_by_custom_score(obj_list, share0, share1, pubkey, mu, n, n_sq,
+                                alpha=0.7, beta=0.3, denom_eps_int: int = 1):
+    """
+    用纯整数进行比较，避免超大 int 转 float 溢出。
+    评分：score = (alpha * qual) / (beta * cost)
+    比较两个解 a、b 的分数，用交叉相乘：
+      (a_num / a_den) ? (b_num / b_den)
+    其中：
+      a_num = alpha_num * beta_den * qual_a
+      a_den = beta_num  * alpha_den * max(cost_a, denom_eps_int)   # 防 0/负
+    alpha_num/alpha_den、beta_num/beta_den 来自 Fraction(alpha), Fraction(beta)
+    """
+    # 把 alpha、beta 表示成分数，避免浮点
+    frac_a = Fraction(alpha).limit_denominator(10**6)  # 0.7 -> 7/10
+    frac_b = Fraction(beta ).limit_denominator(10**6)  # 0.3 -> 3/10
+
+    aN, aD = frac_a.numerator, frac_a.denominator
+    bN, bD = frac_b.numerator, frac_b.denominator
+
     best_idx = None
-    best_score = float('-inf')
+    best_num = None
+    best_den = None
+
     for i, (_, enc_cost, enc_qual) in enumerate(obj_list):
+        # 解密并做有符号映射
         dec_cost = combine_shares(
             partial_decrypt(enc_cost, share0, pubkey, n_sq),
             partial_decrypt(enc_cost, share1, pubkey, n_sq),
@@ -355,10 +394,22 @@ def select_best_by_custom_score(obj_list, share0, share1, pubkey, mu, n, n_sq, a
             partial_decrypt(enc_qual, share1, pubkey, n_sq),
             mu, n
         )
-        score = (dec_qual * alpha) / (dec_cost * beta + eps)
-        if score > best_score:
-            best_score = score
+        cost = to_signed_mod(dec_cost, n)
+        qual = to_signed_mod(dec_qual, n)
+
+        # 分母防 0/负（按你的任务定义 cost 应该为正，但加个兜底更稳）
+        denom_cost = cost if cost > 0 else denom_eps_int
+
+        # 计算“整数化”的分子和分母（均为正整型）
+        num = aN * bD * int(qual)       # alpha_num * beta_den * qual
+        den = bN * aD * int(denom_cost) # beta_num  * alpha_den * cost
+
+        # 第一个候选或更优就更新（交叉相乘避免浮点）
+        if best_idx is None or (num * best_den > best_num * den):
             best_idx = i
+            best_num = num
+            best_den = den
+
     return best_idx
 
 
@@ -1123,139 +1174,302 @@ def run_mopso_mm(pubkey, enc_costs, enc_quals, enc_weights,
 
     return best_x, best_cost, best_qual, parents_objs
 
+import os, json
+from datetime import datetime
+
+import json
+import time
+from datetime import datetime
+from openpyxl import load_workbook
+
+def save_pareto_set_to_excel(xlsx_path: str, params: dict, pareto_set: list,
+                             runtime_sec: float, pubkey, share0, share1, mu, n, n_sq):
+    xlsx_path = ensure_results_sheet(xlsx_path)
+    wb = load_workbook(xlsx_path)
+    ws = wb["Results"]
+
+    for sol_idx in pareto_set:
+        x, enc_cost, enc_qual = sol_idx
+
+        # 解密
+        dec_cost = combine_shares(
+            partial_decrypt(enc_cost, share0, pubkey, n_sq),
+            partial_decrypt(enc_cost, share1, pubkey, n_sq),
+            mu, n
+        )
+        dec_qual = combine_shares(
+            partial_decrypt(enc_qual, share0, pubkey, n_sq),
+            partial_decrypt(enc_qual, share1, pubkey, n_sq),
+            mu, n
+        )
+
+        # ⚠️ 新增：有符号映射，避免巨大整数写入
+        dec_cost = to_signed_mod(dec_cost, n)
+        dec_qual = to_signed_mod(dec_qual, n)
+
+        # 如仍担心（极少见），也可以把两个值转成字符串写入：
+        # write_cost = dec_cost if abs(dec_cost) < 10**12 else str(dec_cost)
+        # write_qual = dec_qual if abs(dec_qual) < 10**12 else str(dec_qual)
+
+        ws.append([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            int(params["num_tasks"]), int(params["num_workers"]), int(params["min_assign"]),
+            int(params["num_iter"]), int(params["pop_size"]),
+            int(dec_cost), int(dec_qual), len(pareto_set),
+            float(f"{runtime_sec:.2f}"),
+            json.dumps(x, ensure_ascii=False)
+        ])
+
+    wb.save(xlsx_path)
+
+
+def ensure_results_sheet(xlsx_path: str):
+    """确保 xlsx 存在且含 Results 表（带表头）；不存在就创建。返回最终可写入的路径。"""
+    from openpyxl import Workbook, load_workbook
+
+    # 若目录不存在先建目录
+    dir_ = os.path.dirname(os.path.abspath(xlsx_path))
+    if dir_ and not os.path.exists(dir_):
+        os.makedirs(dir_, exist_ok=True)
+
+    if not os.path.exists(xlsx_path):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Results"
+        ws.append([
+            "timestamp","num_tasks","num_workers","min_assign","num_iter","pop_size",
+            "best_cost","best_qual","pareto_count","runtime_sec","best_x_json"
+        ])
+        wb.save(xlsx_path)
+        return xlsx_path
+
+    # 已存在则确保有 Results 表和表头
+    wb = load_workbook(xlsx_path)
+    if "Results" not in wb.sheetnames:
+        ws = wb.create_sheet("Results")
+        ws.append([
+            "timestamp","num_tasks","num_workers","min_assign","num_iter","pop_size",
+            "best_cost","best_qual","pareto_count","runtime_sec","best_x_json"
+        ])
+        wb.save(xlsx_path)
+    return xlsx_path
+
+def append_run_result(xlsx_path: str, params: dict, best_cost: int, best_qual: int,
+                      pareto_count: int, runtime_sec: float, best_x):
+    xlsx_path = ensure_results_sheet(xlsx_path)
+    wb = load_workbook(xlsx_path)
+    ws = wb["Results"]
+
+    # ⚠️ 新增：映射（若已经是映射后的，可直接保留）
+    if isinstance(best_cost, int) and 'n' in params.get('_internal_mods_', {}):
+        best_cost = to_signed_mod(best_cost, params['_internal_mods_']['n'])
+    if isinstance(best_qual, int) and 'n' in params.get('_internal_mods_', {}):
+        best_qual = to_signed_mod(best_qual, params['_internal_mods_']['n'])
+
+    ws.append([
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        int(params["num_tasks"]), int(params["num_workers"]), int(params["min_assign"]),
+        int(params["num_iter"]), int(params["pop_size"]),
+        int(best_cost), int(best_qual), int(pareto_count), float(f"{runtime_sec:.2f}"),
+        json.dumps(best_x, ensure_ascii=False)
+    ])
+    wb.save(xlsx_path)
 
 # -----------------------------
 # 程序入口（调用 MODE 版本）
 # -----------------------------
 def main():
-    # 清空旧文件
-    for file in ["enc_worker_data.pkl", "threshold_key_shares.pkl", "offline_cache.pkl"]:
-        if os.path.exists(file):
-            os.remove(file)
+    # ✅ 参数设置（从 Excel 读取多组；每行一组参数）
+    import pandas as pd
 
-    print("🔐 加密众包优化系统（MODE 对比版）启动...")
+    excel_path = 'data_mopso.xlsx'  # 你的参数表；Sheet 名：Config
+    df_cfg = pd.read_excel(excel_path, sheet_name='Config')
 
-    # 参数设置
-    num_tasks = 5
-    num_workers = 15
-    min_assign = 1
-    num_iter = 10
-    pop_size = 5
-    # 上传加密数据（含位置与最大距离）
-    simulate_worker_upload(num_tasks=num_tasks, num_workers=num_workers)
+    # 要求表头包含以下列名（不区分大小写也可自己统一转小写）：
+    # num_tasks, num_workers, min_assign, num_iter, pop_size
+    need = {'num_tasks', 'num_workers', 'min_assign', 'num_iter', 'pop_size'}
+    lowermap = {c.lower(): c for c in df_cfg.columns}
+    if not need.issubset(lowermap.keys()):
+        raise ValueError(f"Config表头缺少列：{need - set(lowermap.keys())}，请确保含有 {need}")
 
-    (pubkey, enc_costs, enc_quals, enc_weights,
-     enc_task_locs, enc_worker_locs, enc_max_dists,
-     raw_costs, raw_quals, raw_weights,
-     raw_task_locs, raw_worker_locs, raw_max_dists,
-     share0, share1, mu, n, n_sq, max_budgets) = prepare_data(num_tasks=num_tasks, num_workers=num_workers)
+    # 循环每一行参数组合：对每一组都完整执行下面的原始流程
+    for _row_i, row in df_cfg.iterrows():
 
-    print("\n📌 工人成本权重向量:")
-    print(raw_weights)
+        print(f"\n==================== 参数组合 #{_row_i + 1} ====================")
+        num_tasks = int(row[lowermap['num_tasks']])
+        num_workers = int(row[lowermap['num_workers']])
+        min_assign = int(row[lowermap['min_assign']])
+        num_iter = int(row[lowermap['num_iter']])
+        pop_size = int(row[lowermap['pop_size']])
 
-    print("\n📌 工人成本矩阵:")
-    for i in range(num_workers):
-        worker_costs = [raw_costs[t][i] for t in range(num_tasks)]
-        print(f"工人 {i + 1}: {worker_costs}")
+        print(f"本次运行参数：num_tasks={num_tasks}, num_workers={num_workers}, "
+              f"min_assign={min_assign}, num_iter={num_iter}, pop_size={pop_size}")
 
-    print("\n📌 工人位置与最大可接受距离:")
-    for i, ((x, y), dmax) in enumerate(zip(raw_worker_locs, raw_max_dists)):
-        print(f"工人 {i + 1}: ({x}, {y})，最大距离: {dmax}")
+        # --- 新增：DE 至少需要 4 个个体 ---
+        if pop_size < 4:
+            print("⚠️ Config 中的 pop_size < 4，已自动提升为 4（DE 至少需要 4 个个体）")
+            pop_size = 4
 
-    print("\n📌 任务质量矩阵:")
-    for t in range(num_tasks):
-        print(f"任务 {t+1}: {raw_quals[t]}")
+        # 执行每组参数 5 次
+        for run in range(50):  # 内部循环，执行 5 次
+            print(f"执行第 {run + 1} 次...")
+            # 清空旧文件
+            for file in ["enc_worker_data.pkl", "threshold_key_shares.pkl", "offline_cache.pkl"]:
+                if os.path.exists(file):
+                    os.remove(file)
 
-    print("\n📌 任务位置坐标:")
-    for t, (x, y) in enumerate(raw_task_locs):
-        print(f"任务 {t + 1}: ({x}, {y})")
+            print("🔐 加密众包优化系统（MODE 对比版）启动...")
+            # 上传加密数据（含位置与最大距离）
+            simulate_worker_upload(num_tasks=num_tasks, num_workers=num_workers)
 
-    # 离线缓存
-    if not os.path.exists("offline_cache.pkl"):
-        generate_offline_cache(pubkey, num_sets=300, num_workers=16)
-    print(f"✅ 已加载离线缓存")
+            (pubkey, enc_costs, enc_quals, enc_weights,
+             enc_task_locs, enc_worker_locs, enc_max_dists,
+             raw_costs, raw_quals, raw_weights,
+             raw_task_locs, raw_worker_locs, raw_max_dists,
+             share0, share1, mu, n, n_sq, max_budgets) = prepare_data(num_tasks=num_tasks, num_workers=num_workers)
 
-    # reach[t][i]
-    print("\n🧮 正在计算可达性矩阵 reach[t][i]...")
-    reach = check_reachability_matrix(enc_task_locs, enc_worker_locs, enc_max_dists,
-                                      pubkey, share0, share1, mu, n, n_sq)
-    print("\n📌 可达性矩阵（1=可分配，0=超距）:")
-    for t in range(num_tasks):
-        print(f"任务 {t+1}: {reach[t]}")
-    check_task_reachability(reach)
+            print("\n📌 工人成本权重向量:")
+            print(raw_weights)
 
-    # 初始化种群（考虑可达性）
-    population = [generate_random_matrix_with_reach(num_tasks, num_workers, min_assign, reach)
-                  for _ in range(pop_size)]
+            print("\n📌 工人成本矩阵:")
+            for i in range(num_workers):
+                worker_costs = [raw_costs[t][i] for t in range(num_tasks)]
+                print(f"工人 {i + 1}: {worker_costs}")
 
-    # 启动 MODE 优化
-    start_time = time.time()
-    best_x, enc_best_cost, enc_best_qual, obj_list = run_mopso_mm(
-        pubkey=pubkey,
-        enc_costs=enc_costs,
-        enc_quals=enc_quals,
-        enc_weights=enc_weights,
-        share0=share0, share1=share1, mu=mu, n=n, n_sq=n_sq,
-        reach=reach,
-        num_iter=num_iter, pop_size=pop_size,
-        num_tasks=num_tasks, min_assign=min_assign,
-        fast_mode=False,
-        init_population=population,
-        max_budgets=max_budgets,
-        # 可按需调参：
-        w_start=0.7, w_end=0.4, c1=1.6, c2=1.6,
-        vmax=3.5, archive_max=120, clear_ratio=0.05,
-        jitter_sigma=0.25, flip_prob=0.03
-    )
+            print("\n📌 工人位置与最大可接受距离:")
+            for i, ((x, y), dmax) in enumerate(zip(raw_worker_locs, raw_max_dists)):
+                print(f"工人 {i + 1}: ({x}, {y})，最大距离: {dmax}")
 
-    print("当前 obj_list（最终一代）内容：")
-    for i, (x, enc_cost, enc_qual) in enumerate(obj_list):
-        dec_cost = combine_shares(
-            partial_decrypt(enc_cost, share0, pubkey, n_sq),
-            partial_decrypt(enc_cost, share1, pubkey, n_sq),
-            mu, n
-        )
-        dec_qual = combine_shares(
-            partial_decrypt(enc_qual, share0, pubkey, n_sq),
-            partial_decrypt(enc_qual, share1, pubkey, n_sq),
-            mu, n
-        )
-        print(f"解 {i}: 成本 = {dec_cost}, 质量 = {dec_qual}")
+            print("\n📌 任务质量矩阵:")
+            for t in range(num_tasks):
+                print(f"任务 {t+1}: {raw_quals[t]}")
 
-    pareto_indices = fast_non_dominated_sort_enc(obj_list, pubkey, share0, share1, mu, n, n_sq)[0]
-    print(f"\n🎯 非支配解集个数：{len(pareto_indices)}")
-    for i in pareto_indices:
-        x, enc_cost, enc_qual = obj_list[i]
-        dec_cost = combine_shares(
-            partial_decrypt(enc_cost, share0, pubkey, n_sq),
-            partial_decrypt(enc_cost, share1, pubkey, n_sq),
-            mu, n
-        )
-        dec_qual = combine_shares(
-            partial_decrypt(enc_qual, share0, pubkey, n_sq),
-            partial_decrypt(enc_qual, share1, pubkey, n_sq),
-            mu, n
-        )
-        print(f"🧬 解 {i}: 成本 = {dec_cost}, 质量 = {dec_qual}")
+            print("\n📌 任务位置坐标:")
+            for t, (x, y) in enumerate(raw_task_locs):
+                print(f"任务 {t + 1}: ({x}, {y})")
 
-    print(f"\n✅ 最终任务分配方案：")
-    for t, task_assign in enumerate(best_x):
-        print(f"任务 {t + 1}: {task_assign}")
+            # 离线缓存
+            if not os.path.exists("offline_cache.pkl"):
+                generate_offline_cache(pubkey, num_sets=300, num_workers=16)
+            print(f"✅ 已加载离线缓存")
 
-    dec_best_cost = combine_shares(
-        partial_decrypt(enc_best_cost, share0, pubkey, n_sq),
-        partial_decrypt(enc_best_cost, share1, pubkey, n_sq),
-        mu, n
-    )
-    dec_best_qual = combine_shares(
-        partial_decrypt(enc_best_qual, share0, pubkey, n_sq),
-        partial_decrypt(enc_best_qual, share1, pubkey, n_sq),
-        mu, n
-    )
-    print(f"\n🔓 解密后目标值：")
-    print(f"📉 总成本 = {dec_best_cost}")
-    print(f"📈 总质量 = {dec_best_qual}")
-    print(f"\n⏱️ 本次运行耗时：{time.time() - start_time:.2f} 秒")
+            # reach[t][i]
+            print("\n🧮 正在计算可达性矩阵 reach[t][i]...")
+            reach = check_reachability_matrix(enc_task_locs, enc_worker_locs, enc_max_dists,
+                                              pubkey, share0, share1, mu, n, n_sq)
+            print("\n📌 可达性矩阵（1=可分配，0=超距）:")
+            for t in range(num_tasks):
+                print(f"任务 {t+1}: {reach[t]}")
+            check_task_reachability(reach)
+
+            # 初始化种群（考虑可达性）
+            population = [generate_random_matrix_with_reach(num_tasks, num_workers, min_assign, reach)
+                          for _ in range(pop_size)]
+
+            # 启动 MODE 优化
+            start_time = time.time()
+            best_x, enc_best_cost, enc_best_qual, obj_list = run_mopso_mm(
+                pubkey=pubkey,
+                enc_costs=enc_costs,
+                enc_quals=enc_quals,
+                enc_weights=enc_weights,
+                share0=share0, share1=share1, mu=mu, n=n, n_sq=n_sq,
+                reach=reach,
+                num_iter=num_iter, pop_size=pop_size,
+                num_tasks=num_tasks, min_assign=min_assign,
+                fast_mode=False,
+                init_population=population,
+                max_budgets=max_budgets,
+                # 可按需调参：
+                w_start=0.7, w_end=0.4, c1=1.6, c2=1.6,
+                vmax=3.5, archive_max=120, clear_ratio=0.05,
+                jitter_sigma=0.25, flip_prob=0.03
+            )
+
+            print("当前 obj_list（最终一代）内容：")
+            for i, (x, enc_cost, enc_qual) in enumerate(obj_list):
+                dec_cost = combine_shares(
+                    partial_decrypt(enc_cost, share0, pubkey, n_sq),
+                    partial_decrypt(enc_cost, share1, pubkey, n_sq),
+                    mu, n
+                )
+                dec_qual = combine_shares(
+                    partial_decrypt(enc_qual, share0, pubkey, n_sq),
+                    partial_decrypt(enc_qual, share1, pubkey, n_sq),
+                    mu, n
+                )
+                dec_cost = to_signed_mod(dec_cost, n)
+                dec_qual = to_signed_mod(dec_qual, n)
+                print(f"解 {i}: 成本 = {dec_cost}, 质量 = {dec_qual}")
+
+            pareto_indices = fast_non_dominated_sort_enc(obj_list, pubkey, share0, share1, mu, n, n_sq)[0]
+            print(f"\n🎯 非支配解集个数：{len(pareto_indices)}")
+            for i in pareto_indices:
+                x, enc_cost, enc_qual = obj_list[i]
+                dec_cost = combine_shares(
+                    partial_decrypt(enc_cost, share0, pubkey, n_sq),
+                    partial_decrypt(enc_cost, share1, pubkey, n_sq),
+                    mu, n
+                )
+                dec_qual = combine_shares(
+                    partial_decrypt(enc_qual, share0, pubkey, n_sq),
+                    partial_decrypt(enc_qual, share1, pubkey, n_sq),
+                    mu, n
+                )
+                print(f"🧬 解 {i}: 成本 = {dec_cost}, 质量 = {dec_qual}")
+
+            print(f"\n✅ 最终任务分配方案：")
+            for t, task_assign in enumerate(best_x):
+                print(f"任务 {t + 1}: {task_assign}")
+
+            dec_best_cost = combine_shares(
+                partial_decrypt(enc_best_cost, share0, pubkey, n_sq),
+                partial_decrypt(enc_best_cost, share1, pubkey, n_sq),
+                mu, n
+            )
+            dec_best_qual = combine_shares(
+                partial_decrypt(enc_best_qual, share0, pubkey, n_sq),
+                partial_decrypt(enc_best_qual, share1, pubkey, n_sq),
+                mu, n
+            )
+            dec_best_cost = to_signed_mod(dec_best_cost, n)
+            dec_best_qual = to_signed_mod(dec_best_qual, n)
+
+            print(f"\n🔓 解密后目标值：")
+            print(f"📉 总成本 = {dec_best_cost}")
+            print(f"📈 总质量 = {dec_best_qual}")
+
+            print(f"\n⏱️ 本次运行耗时：{time.time() - start_time:.2f} 秒")
+            # ===== 你的原始逻辑到此结束；下一轮循环自动开始 =====
+
+            # ===== 写入 Results 工作表 =====
+            excel_path = "data_mopso.xlsx"  # 自己的结果文件名/路径
+            params_for_log = {
+                "num_tasks": num_tasks,
+                "num_workers": num_workers,
+                "min_assign": min_assign,
+                "num_iter": num_iter,
+                "pop_size": pop_size
+            }
+            runtime = time.time() - start_time
+            pareto_indices = fast_non_dominated_sort_enc(obj_list, pubkey, share0, share1, mu, n, n_sq)[0]
+
+            # 保存所有非支配解集到 Excel
+            print(f"✅ 正在保存非支配解集到 Excel ...")
+            save_pareto_set_to_excel(
+                xlsx_path=excel_path,
+                params=params_for_log,
+                pareto_set=[obj_list[i] for i in pareto_indices],
+                runtime_sec=runtime,
+                pubkey=pubkey,
+                share0=share0,
+                share1=share1,
+                mu=mu,
+                n=n,
+                n_sq=n_sq
+            )
+
+            print(f"✅ 结果已保存到 {excel_path} -> Results")
 
 if __name__ == "__main__":
     main()

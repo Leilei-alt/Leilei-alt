@@ -174,6 +174,11 @@ def combine_shares(u0, u1, mu, n, max_bits=4096):
     m = (L * mu) % n         # 恢复明文
     return int(m)
 
+def to_signed_mod(m: int, n: int) -> int:
+    """把模 n 的无符号代表元映射回有符号整数区间 (-n/2, n/2]"""
+    return m - n if m > (n // 2) else m
+
+
 # -------------------------------
 # 随机解生成与变异（初始化考虑 reach 约束）
 # -------------------------------
@@ -209,7 +214,12 @@ def generate_random_matrix_with_reach(num_tasks, num_workers, min_assign, reach)
 # ----------------------------------------------------
 # 非支配排序 & 判重（保持不变）
 # ----------------------------------------------------
-def is_duplicate(new_sol, pareto_set, pubkey, share0, share1, mu, n, n_sq, epsilon=1e-6):
+def is_duplicate(new_sol, pareto_set, pubkey, share0, share1, mu, n, n_sq, epsilon_int: int = 0):
+    """
+    判重：将解密结果做有符号映射后，用整数比较。
+    epsilon_int 为整数阈值（0 表示严格相等才算重复）
+    """
+    # 新解解密 + 映射
     enc_cost_new = new_sol[1]
     enc_qual_new = new_sol[2]
     dec_cost_new = combine_shares(
@@ -222,11 +232,13 @@ def is_duplicate(new_sol, pareto_set, pubkey, share0, share1, mu, n, n_sq, epsil
         partial_decrypt(enc_qual_new, share1, pubkey, n_sq),
         mu, n
     )
-    new_sol_array = np.array([dec_cost_new, dec_qual_new])
+    cost_new = to_signed_mod(dec_cost_new, n)
+    qual_new = to_signed_mod(dec_qual_new, n)
 
     for sol in pareto_set:
         enc_cost_sol = sol[1]
         enc_qual_sol = sol[2]
+
         dec_cost_sol = combine_shares(
             partial_decrypt(enc_cost_sol, share0, pubkey, n_sq),
             partial_decrypt(enc_cost_sol, share1, pubkey, n_sq),
@@ -237,9 +249,12 @@ def is_duplicate(new_sol, pareto_set, pubkey, share0, share1, mu, n, n_sq, epsil
             partial_decrypt(enc_qual_sol, share1, pubkey, n_sq),
             mu, n
         )
-        sol_array = np.array([dec_cost_sol, dec_qual_sol])
-        distance = np.linalg.norm(new_sol_array - sol_array)
-        if distance < epsilon:
+        cost_sol = to_signed_mod(dec_cost_sol, n)
+        qual_sol = to_signed_mod(dec_qual_sol, n)
+
+        # 用整数的 L1 距离（也可以用等值比较）
+        l1 = abs(cost_new - cost_sol) + abs(qual_new - qual_sol)
+        if l1 <= epsilon_int:
             return True
     return False
 
@@ -331,10 +346,33 @@ def integrate_elite_selection(population, crowding_dict, k, pubkey, share0, shar
         elite_indices += supplement
     return elite_indices
 
-def select_best_by_custom_score(obj_list, share0, share1, pubkey, mu, n, n_sq, alpha=0.7, beta=0.3, eps=1e-6):
+from fractions import Fraction
+
+def select_best_by_custom_score(obj_list, share0, share1, pubkey, mu, n, n_sq,
+                                alpha=0.7, beta=0.3, denom_eps_int: int = 1):
+    """
+    用纯整数进行比较，避免超大 int 转 float 溢出。
+    评分：score = (alpha * qual) / (beta * cost)
+    比较两个解 a、b 的分数，用交叉相乘：
+      (a_num / a_den) ? (b_num / b_den)
+    其中：
+      a_num = alpha_num * beta_den * qual_a
+      a_den = beta_num  * alpha_den * max(cost_a, denom_eps_int)   # 防 0/负
+    alpha_num/alpha_den、beta_num/beta_den 来自 Fraction(alpha), Fraction(beta)
+    """
+    # 把 alpha、beta 表示成分数，避免浮点
+    frac_a = Fraction(alpha).limit_denominator(10**6)  # 0.7 -> 7/10
+    frac_b = Fraction(beta ).limit_denominator(10**6)  # 0.3 -> 3/10
+
+    aN, aD = frac_a.numerator, frac_a.denominator
+    bN, bD = frac_b.numerator, frac_b.denominator
+
     best_idx = None
-    best_score = float('-inf')
+    best_num = None
+    best_den = None
+
     for i, (_, enc_cost, enc_qual) in enumerate(obj_list):
+        # 解密并做有符号映射
         dec_cost = combine_shares(
             partial_decrypt(enc_cost, share0, pubkey, n_sq),
             partial_decrypt(enc_cost, share1, pubkey, n_sq),
@@ -345,11 +383,25 @@ def select_best_by_custom_score(obj_list, share0, share1, pubkey, mu, n, n_sq, a
             partial_decrypt(enc_qual, share1, pubkey, n_sq),
             mu, n
         )
-        score = (dec_qual * alpha) / (dec_cost * beta + eps)
-        if score > best_score:
-            best_score = score
+        cost = to_signed_mod(dec_cost, n)
+        qual = to_signed_mod(dec_qual, n)
+
+        # 分母防 0/负（按你的任务定义 cost 应该为正，但加个兜底更稳）
+        denom_cost = cost if cost > 0 else denom_eps_int
+
+        # 计算“整数化”的分子和分母（均为正整型）
+        num = aN * bD * int(qual)       # alpha_num * beta_den * qual
+        den = bN * aD * int(denom_cost) # beta_num  * alpha_den * cost
+
+        # 第一个候选或更优就更新（交叉相乘避免浮点）
+        if best_idx is None or (num * best_den > best_num * den):
             best_idx = i
+            best_num = num
+            best_den = den
+
     return best_idx
+
+
 
 
 # ================== 密文乘法（SMUL）— 与你现有缓存/阈值流程兼容 ==================
@@ -828,35 +880,59 @@ def make_float_from_binary(population):
         pop_float.append(arr)
     return pop_float
 
-def de_mutation_and_crossover(idx, pop_float, F=0.5, CR=0.9):
-    """
-    DE/rand/1/bin：v = x_r1 + F * (x_r2 - x_r3)；u = binomial crossover(u,parent)
-    """
-    M = len(pop_float)
-    idxs = list(range(M))
-    idxs.remove(idx)
-    r1, r2, r3 = random.sample(idxs, 3)
-    x = pop_float[idx]
-    x_r1 = pop_float[r1]
-    x_r2 = pop_float[r2]
-    x_r3 = pop_float[r3]
-    v = x_r1 + F * (x_r2 - x_r3)
+import numpy as np
 
-    # binomial crossover
-    T, N = x.shape
-    u = np.array(x, copy=True)
-    for t in range(T):
-        for n in range(N):
-            if random.random() < CR:
-                u[t, n] = v[t, n]
+import numpy as np
+
+def de_mutation_and_crossover(i, pop_float, F=0.5, CR=0.9, lower=-2.0, upper=2.0, rng=None):
+    rng = np.random.default_rng() if rng is None else rng
+    pop = np.asarray(pop_float, dtype=float)          # (NP, *G_shape)
+    NP = pop.shape[0]
+
+    # 将 i 转为纯 int，避免 numpy 标量带来的比较问题
+    if not isinstance(i, (int, np.integer)):
+        i = int(np.asarray(i).item())
+    if not (0 <= i < NP):
+        raise IndexError(f"索引 i={i} 超界（0..{NP-1}）")
+
+    G_shape = pop.shape[1:]                           # 例如 (5, 15)
+    D = int(np.prod(G_shape))                         # 例如 75
+
+    # 预先准备边界
+    lower_b = np.broadcast_to(lower, G_shape).reshape(D)
+    upper_b = np.broadcast_to(upper, G_shape).reshape(D)
+    x_i = pop[i].reshape(D)
+
+    # ---------- 人口不足的降级策略（避免直接抛错） ----------
+    if NP < 4:
+        # 对当前体做小幅高斯扰动，裁剪到边界
+        scale = (upper_b - lower_b) * 0.05
+        v = np.clip(x_i + rng.normal(0.0, 1.0, size=D) * scale, lower_b, upper_b)
+    else:
+        # ---------- 标准 DE/rand/1/bin ----------
+        pool = np.delete(np.arange(NP), i)            # 去掉 i
+        a_idx, b_idx, c_idx = rng.choice(pool, 3, replace=False)
+        a = pop[a_idx].reshape(D)
+        b = pop[b_idx].reshape(D)
+        c = pop[c_idx].reshape(D)
+        v = a + F * (b - c)
+        v = np.minimum(np.maximum(v, lower_b), upper_b)
+
+    # 交叉：保证至少一位发生交叉
+    mask = (rng.random(D) < CR)
+    if not mask.any():
+        mask[rng.integers(D)] = True
+
+    u = np.where(mask, v, x_i).reshape(G_shape)       # 还原成 (T, N)
     return u
+
+
 
 def environment_selection_MODE(parents, parents_objs, offsprings, off_objs,
                                pubkey, share0, share1, mu, n, n_sq, pop_size, alpha_for_crowding=0.5):
     """
     MODE 的环境选择：父代+子代合并→非支配排序→前几层塞满；最后一层用密态加权拥塞距离筛选。
-    parents/offsprings: List[solution]
-    parents_objs/off_objs: List[(x, enc_cost, enc_qual)]
+    不足 pop_size 时，从剩余候选中随机补齐（保证人口恒定）。
     """
     combined_pop = parents + offsprings
     combined_obj = parents_objs + off_objs
@@ -864,27 +940,44 @@ def environment_selection_MODE(parents, parents_objs, offsprings, off_objs,
     fronts = fast_non_dominated_sort_enc(combined_obj, pubkey, share0, share1, mu, n, n_sq)
     new_pop = []
     new_objs = []
+    selected_indices = set()
 
     for f in fronts:
         if len(new_pop) + len(f) <= pop_size:
             for idx in f:
                 new_pop.append(combined_pop[idx])
                 new_objs.append(combined_obj[idx])
+                selected_indices.add(idx)
         else:
             # 需要在该 front 内部挑 K 个
             k = pop_size - len(new_pop)
             if k <= 0:
                 break
-            crowding_dict = compute_weighted_crowding_distance(combined_obj, combined_pop, f,
-                                                               pubkey, share0, share1, mu, n, n_sq,
-                                                               alpha=alpha_for_crowding)
+            crowding_dict = compute_weighted_crowding_distance(
+                combined_obj, combined_pop, f,
+                pubkey, share0, share1, mu, n, n_sq,
+                alpha=alpha_for_crowding
+            )
             topk = select_topk_by_enc_value(crowding_dict, k, pubkey, share0, share1, mu, n, n_sq)
             for idx in topk:
                 new_pop.append(combined_pop[idx])
                 new_objs.append(combined_obj[idx])
+                selected_indices.add(idx)
             break
 
+    # --- 兜底：若仍不足 pop_size，则从剩余个体随机补齐 ---
+    if len(new_pop) < pop_size:
+        all_indices = list(range(len(combined_pop)))
+        remaining = [idx for idx in all_indices if idx not in selected_indices]
+        need = pop_size - len(new_pop)
+        if remaining:
+            supplement = random.sample(remaining, min(need, len(remaining)))
+            for idx in supplement:
+                new_pop.append(combined_pop[idx])
+                new_objs.append(combined_obj[idx])
+
     return new_pop, new_objs
+
 
 
 
@@ -897,6 +990,11 @@ def run_mode(pubkey, enc_costs, enc_quals, enc_weights,
     """
     MODE（差分进化）主循环
     """
+    # run_mode 开头
+    if pop_size < 4:
+        print("⚠️ run_mode 收到 pop_size < 4，自动提升为 4")
+        pop_size = 4
+
     N = len(enc_costs[0])
     T = num_tasks
 
@@ -908,6 +1006,11 @@ def run_mode(pubkey, enc_costs, enc_quals, enc_weights,
         population = [generate_random_matrix_with_reach(T, N, min_assign, reach)
                       for _ in range(pop_size)]
         print("✅ 默认生成初始种群")
+
+    # --- 新增：极端情况下的初始化补齐（通常不会触发） ---
+    if len(population) < pop_size:
+        for _ in range(pop_size - len(population)):
+            population.append(generate_random_matrix_with_reach(T, N, min_assign, reach))
 
     # 评估父代
     parents_objs = parallel_evaluate_population(
@@ -947,6 +1050,20 @@ def run_mode(pubkey, enc_costs, enc_quals, enc_weights,
             pop_size=pop_size, alpha_for_crowding=0.5
         )
 
+        # --- 新增：若极端情况下选择后低于 pop_size，则补齐并评估 ---
+        if len(population) < pop_size:
+            for _ in range(pop_size - len(population)):
+                population.append(generate_random_matrix_with_reach(T, N, min_assign, reach))
+            # 仅评估新增个体；为了简单可直接整体重评估一次：
+            parents_objs = parallel_evaluate_population(
+                population=population,
+                enc_costs=enc_costs,
+                enc_quals=enc_quals,
+                enc_weights=enc_weights,
+                pubkey=pubkey, share0=share0, share1=share1, mu=mu, n=n, n_sq=n_sq,
+                min_assign=min_assign, fast_mode=fast_mode, max_budgets=max_budgets
+            )
+
         # 同步浮点表示（以当前二值为基，回填到±2.0 以稳定后续 DE）
         pop_float = [np.where(np.array(x)>0.5, 2.0, -2.0).astype(float) for x in population]
 
@@ -973,17 +1090,52 @@ import time
 from datetime import datetime
 from openpyxl import load_workbook
 
-def save_pareto_set_to_excel(xlsx_path: str, params: dict, pareto_set: list,runtime_sec: float, pubkey, share0, share1, mu, n, n_sq):
+# === Excel 写入安全转换，避免 OverflowError / NaN/Inf ===
+EXCEL_SAFE_INT = 2**53 - 1  # Excel(IEEE-754 double) 约 15 位十进制精度
+
+try:
+    import numpy as _np
+except Exception:
+    _np = None
+
+def _is_np_int(x):
+    return _np is not None and isinstance(x, _np.integer)
+
+def _is_np_float(x):
+    return _np is not None and isinstance(x, _np.floating)
+
+def coerce_for_excel(v):
+    # numpy 标量 -> Python 原生
+    if _is_np_int(v) or _is_np_float(v):
+        v = v.item()
+
+    # 特大整数 -> 转成字符串，避免 openpyxl 尝试 float() 溢出
+    if isinstance(v, int):
+        return v if abs(v) <= EXCEL_SAFE_INT else str(v)
+
+    # 浮点 NaN/Inf -> 字符串（Excel 不接受）
+    if isinstance(v, float):
+        if not math.isfinite(v):
+            return str(v)
+        return v
+
+    # 其它对象（包括自定义对象）保持原样或字符串化
+    return v
+
+def append_row_safe(ws, row):
+    ws.append([coerce_for_excel(x) for x in row])
+
+def save_pareto_set_to_excel(xlsx_path: str, params: dict, pareto_set: list,
+                             runtime_sec: float, pubkey, share0, share1, mu, n, n_sq):
     """将非支配解集保存到 Excel 文件"""
     xlsx_path = ensure_results_sheet(xlsx_path)
     wb = load_workbook(xlsx_path)
     ws = wb["Results"]
 
-    # 遍历所有 Pareto 解
-    for sol_idx in pareto_set:
-        x, enc_cost, enc_qual = sol_idx
+    for sol in pareto_set:
+        x, enc_cost, enc_qual = sol
 
-        # 解密成本和质量
+        # 解密
         dec_cost = combine_shares(
             partial_decrypt(enc_cost, share0, pubkey, n_sq),
             partial_decrypt(enc_cost, share1, pubkey, n_sq),
@@ -994,64 +1146,74 @@ def save_pareto_set_to_excel(xlsx_path: str, params: dict, pareto_set: list,runt
             partial_decrypt(enc_qual, share1, pubkey, n_sq),
             mu, n
         )
+        # 映射回有符号
+        dec_cost = to_signed_mod(dec_cost, n)
+        dec_qual = to_signed_mod(dec_qual, n)
 
-        # 保存每个解的信息
-        ws.append([
+        # ✅ 用 append_row_safe，自动把超大整数/NaN/Inf 转为字符串
+        append_row_safe(ws, [
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             int(params["num_tasks"]), int(params["num_workers"]), int(params["min_assign"]),
             int(params["num_iter"]), int(params["pop_size"]),
-            int(dec_cost), int(dec_qual), len(pareto_set),  # pareto_count 记录解集的大小
-            float(f"{runtime_sec:.2f}"),  # runtime_sec 留空，后续可以根据需要填充
+            int(dec_cost), int(dec_qual), len(pareto_set),
+            round(runtime_sec, 2),  # 直接 round，避免先转字符串再转回 float
             json.dumps(x, ensure_ascii=False)
         ])
+
+    # ✅ 保存并显式关闭，减少 Windows 上临时文件占用
     wb.save(xlsx_path)
+    wb.close()
+
 
 def ensure_results_sheet(xlsx_path: str):
-    """确保 xlsx 存在且含 Results 表（带表头）；不存在就创建。返回最终可写入的路径。"""
     from openpyxl import Workbook, load_workbook
 
-    # 若目录不存在先建目录
     dir_ = os.path.dirname(os.path.abspath(xlsx_path))
     if dir_ and not os.path.exists(dir_):
         os.makedirs(dir_, exist_ok=True)
+
+    header = [
+        "timestamp","num_tasks","num_workers","min_assign","num_iter","pop_size",
+        "best_cost","best_qual","pareto_count","runtime_sec","best_x_json"
+    ]
 
     if not os.path.exists(xlsx_path):
         wb = Workbook()
         ws = wb.active
         ws.title = "Results"
-        ws.append([
-            "timestamp","num_tasks","num_workers","min_assign","num_iter","pop_size",
-            "best_cost","best_qual","pareto_count","runtime_sec","best_x_json"
-        ])
+        ws.append(header)
         wb.save(xlsx_path)
+        wb.close()
         return xlsx_path
 
-    # 已存在则确保有 Results 表和表头
     wb = load_workbook(xlsx_path)
     if "Results" not in wb.sheetnames:
         ws = wb.create_sheet("Results")
-        ws.append([
-            "timestamp","num_tasks","num_workers","min_assign","num_iter","pop_size",
-            "best_cost","best_qual","pareto_count","runtime_sec","best_x_json"
-        ])
+        ws.append(header)
         wb.save(xlsx_path)
+    wb.close()
     return xlsx_path
+
 
 def append_run_result(xlsx_path: str, params: dict, best_cost: int, best_qual: int,
                       pareto_count: int, runtime_sec: float, best_x):
     """将一次运行结果追加到 Results 表"""
-    from openpyxl import load_workbook
     xlsx_path = ensure_results_sheet(xlsx_path)
     wb = load_workbook(xlsx_path)
     ws = wb["Results"]
-    ws.append([
+
+    append_row_safe(ws, [
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         int(params["num_tasks"]), int(params["num_workers"]), int(params["min_assign"]),
         int(params["num_iter"]), int(params["pop_size"]),
-        int(best_cost), int(best_qual), int(pareto_count), float(f"{runtime_sec:.2f}"),
+        int(best_cost), int(best_qual), int(pareto_count),
+        round(runtime_sec, 2),
         json.dumps(best_x, ensure_ascii=False)
     ])
+
     wb.save(xlsx_path)
+    wb.close()
+
 # -----------------------------
 # 程序入口（调用 MODE 版本）
 # -----------------------------
@@ -1082,8 +1244,14 @@ def main():
 
         print(f"本次运行参数：num_tasks={num_tasks}, num_workers={num_workers}, "
               f"min_assign={min_assign}, num_iter={num_iter}, pop_size={pop_size}")
+
+        # --- 新增：DE 至少需要 4 个个体 ---
+        if pop_size < 4:
+            print("⚠️ Config 中的 pop_size < 4，已自动提升为 4（DE 至少需要 4 个个体）")
+            pop_size = 4
+
         # 执行每组参数 5 次
-        for run in range(5):  # 内部循环，执行 5 次
+        for run in range(50):  # 内部循环，执行 5 次
             print(f"执行第 {run + 1} 次...")
             # 清空旧文件
             for file in ["enc_worker_data.pkl", "threshold_key_shares.pkl", "offline_cache.pkl"]:
@@ -1167,6 +1335,8 @@ def main():
                     partial_decrypt(enc_qual, share1, pubkey, n_sq),
                     mu, n
                 )
+                dec_cost = to_signed_mod(dec_cost, n)
+                dec_qual = to_signed_mod(dec_qual, n)
                 print(f"解 {i}: 成本 = {dec_cost}, 质量 = {dec_qual}")
 
             pareto_indices = fast_non_dominated_sort_enc(obj_list, pubkey, share0, share1, mu, n, n_sq)[0]

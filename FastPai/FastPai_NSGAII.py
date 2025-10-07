@@ -597,7 +597,7 @@ def is_duplicate(new_sol, pareto_set, pubkey, share0, share1, mu, n, n_sq, epsil
         partial_decrypt(enc_qual_new, share1, pubkey, n_sq),
         mu, n
     )
-    new_sol_array = np.array([dec_cost_new, dec_qual_new])  # 明文目标值
+    new_sol_array = np.array([dec_cost_new, dec_qual_new], dtype=float)  # 确保是浮动类型
 
     # 遍历已有帕累托解，解密后比较
     for sol in pareto_set:
@@ -616,10 +616,10 @@ def is_duplicate(new_sol, pareto_set, pubkey, share0, share1, mu, n, n_sq, epsil
             partial_decrypt(enc_qual_sol, share1, pubkey, n_sq),
             mu, n
         )
-        sol_array = np.array([dec_cost_sol, dec_qual_sol])
+        sol_array = np.array([dec_cost_sol, dec_qual_sol], dtype=float)  # 确保是浮动类型
 
         # 计算欧氏距离判断是否重复
-        distance = np.linalg.norm(new_sol_array - sol_array)
+        distance = np.linalg.norm(new_sol_array - sol_array)  # 这里确保是浮动类型
         if distance < epsilon:
             return True
     return False

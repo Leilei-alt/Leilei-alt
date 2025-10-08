@@ -289,6 +289,12 @@ def fast_non_dominated_sort_enc(obj_list, pubkey, share0, share1, mu, n, n_sq):
     if len(fronts[-1]) == 0:
         fronts.pop()
 
+    # ⚠️ 兜底：如果没有任何个体进入第一前沿，退化为“所有个体同属第一前沿”
+    if not fronts and len(obj_list) > 0:
+        fronts = [list(range(len(obj_list)))]
+
+
+
     # 去重（按前面判重规则）
     unique_fronts = []
     for front in fronts:
@@ -567,18 +573,20 @@ def dominates_enc(ind1, ind2, pubkey, share0, share1, mu, n, n_sq):
     enc_cost1, enc_qual1 = ind1[1], ind1[2]
     enc_cost2, enc_qual2 = ind2[1], ind2[2]
 
-    comp1 = secure_compare(enc_cost1, enc_cost2, pubkey, share0, share1, mu, n, n_sq)  # cost1 < cost2 ?
-    comp2 = secure_compare(enc_qual2, enc_qual1, pubkey, share0, share1, mu, n, n_sq) # qual1 > qual2 ?
+    # cost1 < cost2 以及 qual1 > qual2 都用严格比较
+    comp1 = secure_compare(enc_cost1, enc_cost2, pubkey, share0, share1, mu, n, n_sq, strict=True)
+    comp2 = secure_compare(enc_qual2, enc_qual1, pubkey, share0, share1, mu, n, n_sq, strict=True)
 
     u01 = partial_decrypt(comp1, share0, pubkey, n_sq)
     u02 = partial_decrypt(comp2, share0, pubkey, n_sq)
     u11 = partial_decrypt(comp1, share1, pubkey, n_sq)
     u12 = partial_decrypt(comp2, share1, pubkey, n_sq)
 
-    b1 = combine_shares(u01, u11, mu, n)  # cost1 < cost2
-    b2 = combine_shares(u02, u12, mu, n)  # qual1 > qual2
+    b1 = combine_shares(u01, u11, mu, n)  # cost1 < cost2 ?
+    b2 = combine_shares(u02, u12, mu, n)  # qual1 > qual2 ?
 
     return b1 == 1 and b2 == 1
+
 
 def select_topk_by_enc_value(enc_dict, k, pubkey, share0, share1, mu, n, n_sq):
     selected = []
@@ -616,17 +624,30 @@ def select_random_if_empty(enc_dict, k):
 # ----------------------------------------------------
 # 距离/可达性（保持不变）
 # ----------------------------------------------------
-def secure_compare(enc_x, enc_y, pubkey, share0, share1, mu, n, n_sq):
+def secure_compare(enc_x, enc_y, pubkey, share0, share1, mu, n, n_sq, strict=False):
+    """
+    返回 Enc(1) 若 (enc_y ? enc_x) 成立，否则返回 Enc(0)
+      - strict=False : 判断 y >= x
+      - strict=True  : 判断 y >  x
+    """
     cache = get_next_cache_process_safe(pubkey=pubkey)
     r = cache['r1']
     r_dash = random.randint(n // 5, n // 4)
-    enc_diff_base = enc_y - enc_x + pubkey.encrypt(1)
+
+    # 基础差值：strict 时不要 +1（严格），否则 +1（非严格）
+    enc_diff_base = enc_y - enc_x
+    if not strict:
+        enc_diff_base = enc_diff_base + pubkey.encrypt(1)  # y - x + 1  ⇔ y >= x
+
     enc_r_diff = enc_diff_base * r
     enc_full = enc_r_diff + pubkey.encrypt(r_dash)
+
     u0 = partial_decrypt(enc_full, share0, pubkey, n_sq)
     u1 = partial_decrypt(enc_full, share1, pubkey, n_sq)
     d = combine_shares(u0, u1, mu, n)
+
     return cache['enc_1'] if d > r_dash else cache['enc_0']
+
 
 def secure_manhattan_distance(task_loc_enc, worker_loc_enc, pubkey, share0, share1, mu, n, n_sq):
     enc_xt, enc_yt = task_loc_enc
@@ -1251,7 +1272,7 @@ def main():
             pop_size = 4
 
         # 执行每组参数 5 次
-        for run in range(50):  # 内部循环，执行 5 次
+        for run in range(15):  # 内部循环，执行 5 次
             print(f"执行第 {run + 1} 次...")
             # 清空旧文件
             for file in ["enc_worker_data.pkl", "threshold_key_shares.pkl", "offline_cache.pkl"]:

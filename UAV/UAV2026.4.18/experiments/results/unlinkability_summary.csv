@@ -1,0 +1,2 @@
+sessions,stable_pseudo_id,unique_spid_count,unique_ephemeral_key_count,spid_uniqueness_ratio,ephemeral_uniqueness_ratio
+100,True,100,100,1.0,1.0

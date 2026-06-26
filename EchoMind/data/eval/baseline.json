@@ -1,0 +1,129 @@
+{
+  "timestamp": "2026-06-12T02:27:56.983444",
+  "total": 5,
+  "passed": 5,
+  "pass_rate": 1.0,
+  "avg_scores": {
+    "relevance": 1.0,
+    "accuracy": 1.0,
+    "completeness": 0.725,
+    "helpfulness": 0.8625,
+    "intent_accuracy": 1.0
+  },
+  "regressions": [],
+  "recommendations": [
+    "完整性偏低：Agent 可能过早结束回答，考虑在 prompt 中要求提供完整解决方案"
+  ],
+  "results": [
+    {
+      "test_id": "intent_recognition",
+      "passed": true,
+      "scores": {
+        "accuracy": 1.0,
+        "macro_f1": 1.0
+      },
+      "detail": "准确率 100.0%，Macro-F1 1.000",
+      "metadata": {
+        "total": 1,
+        "correct": 1,
+        "cases": [
+          {
+            "message": "应用一直报错",
+            "expected": "technical",
+            "predicted": "technical",
+            "confidence": 0.95,
+            "reasoning": "用户明确提到应用报错，属于技术问题"
+          }
+        ]
+      }
+    },
+    {
+      "test_id": "dialog_0",
+      "passed": true,
+      "scores": {
+        "relevance": 1.0,
+        "accuracy": 1.0,
+        "completeness": 0.6,
+        "helpfulness": 0.8,
+        "overall": 0.85
+      },
+      "detail": "Q: 我的订单还没到... → 综合评分 0.850",
+      "metadata": {
+        "question": "我的订单还没到",
+        "response": "您好，我理解您关心订单配送情况的心情。要为您查询物流状态，我需要您提供订单号。请问方便告诉我吗？",
+        "agent_type": "general",
+        "intent": "complaint",
+        "turn": 0,
+        "conv_id": "eval_0",
+        "judge_failed": false,
+        "judge_error": null
+      }
+    },
+    {
+      "test_id": "dialog_1_turn_0",
+      "passed": true,
+      "scores": {
+        "relevance": 1.0,
+        "accuracy": 1.0,
+        "completeness": 0.6,
+        "helpfulness": 0.8,
+        "overall": 0.85
+      },
+      "detail": "Q: 你好，我要退款... → 综合评分 0.850",
+      "metadata": {
+        "question": "你好，我要退款",
+        "response": "您好！请问您需要退款的订单号是多少？我可以帮您查询并处理退款申请。",
+        "agent_type": "general",
+        "intent": "request",
+        "turn": 0,
+        "conv_id": "eval_1",
+        "judge_failed": false,
+        "judge_error": null
+      }
+    },
+    {
+      "test_id": "dialog_1_turn_1",
+      "passed": true,
+      "scores": {
+        "relevance": 1.0,
+        "accuracy": 1.0,
+        "completeness": 0.8,
+        "helpfulness": 0.9,
+        "overall": 0.925
+      },
+      "detail": "Q: 订单号是 #12345... → 综合评分 0.925",
+      "metadata": {
+        "question": "订单号是 #12345",
+        "response": "感谢您提供订单号 #12345。请问退款原因是商品质量问题、误购还是其他情况呢？我会尽快为您处理相关流程。",
+        "agent_type": "general",
+        "intent": "request",
+        "turn": 1,
+        "conv_id": "eval_1",
+        "judge_failed": false,
+        "judge_error": null
+      }
+    },
+    {
+      "test_id": "dialog_1_turn_2",
+      "passed": true,
+      "scores": {
+        "relevance": 1.0,
+        "accuracy": 1.0,
+        "completeness": 0.9,
+        "helpfulness": 0.95,
+        "overall": 0.9625
+      },
+      "detail": "Q: 退款多久能到账？... → 综合评分 0.963",
+      "metadata": {
+        "question": "退款多久能到账？",
+        "response": "退款通常在3到5个工作日内到账，具体时间取决于您的支付方式和银行处理流程。如果超时未到账，请随时联系我查询进度。",
+        "agent_type": "general",
+        "intent": "query",
+        "turn": 2,
+        "conv_id": "eval_1",
+        "judge_failed": false,
+        "judge_error": null
+      }
+    }
+  ]
+}

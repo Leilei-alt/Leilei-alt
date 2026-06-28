@@ -102,7 +102,7 @@ Bachelor's in Software Engineering, School of Computer Science and Engineering
 
 ## GitHub Stats
 
-Replace `YOUR_GITHUB_USERNAME` with your GitHub username.
+Replace `Leilei-alt` with your GitHub username.
 
 ![GitHub Stats](https://github-readme-stats.vercel.app/api?username=YOUR_GITHUB_USERNAME&show_icons=true&theme=default&hide_border=true)
 
@@ -112,6 +112,6 @@ Replace `YOUR_GITHUB_USERNAME` with your GitHub username.
 
 ## Contact
 
-- Email: `your-email@example.com`
-- GitHub: `https://github.com/YOUR_GITHUB_USERNAME`
+- Email: `13238254566@163.com`
+- GitHub: `https://github.com/Leilei-alt`
 

@@ -104,9 +104,9 @@ Bachelor's in Software Engineering, School of Computer Science and Engineering
 
 Replace `Leilei-alt` with your GitHub username.
 
-![GitHub Stats](https://github-readme-stats.vercel.app/api?username=YOUR_GITHUB_USERNAME&show_icons=true&theme=default&hide_border=true)
+![GitHub Stats](https://github-readme-stats.vercel.app/api?username=Leilei-alt&show_icons=true&theme=default&hide_border=true)
 
-![Top Languages](https://github-readme-stats.vercel.app/api/top-langs/?username=YOUR_GITHUB_USERNAME&layout=compact&theme=default&hide_border=true)
+![Top Languages](https://github-readme-stats.vercel.app/api/top-langs/?username=Leilei-alt&layout=compact&theme=default&hide_border=true)
 
 ---
 

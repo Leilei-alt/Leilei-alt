@@ -102,7 +102,6 @@ Bachelor's in Software Engineering, School of Computer Science and Engineering
 
 ## GitHub Stats
 
-Replace `Leilei-alt` with your GitHub username.
 
 ![GitHub Stats](https://github-readme-stats.vercel.app/api?username=Leilei-alt&show_icons=true&theme=default&hide_border=true)
 
